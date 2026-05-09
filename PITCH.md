@@ -1,10 +1,11 @@
 ## Problem
 
-Every MBB firm has its own AI assistant: Lilli at McKinsey, GENE at BCG, Sage at
-Bain. Employee adoption sits between 75% and 90%. The dashboards say success.
-The partners know that's a vanity metric. We turn the session logs they already
-keep into the three answers no one else has: who to back, where to cut, and what
-the firm is collectively failing to learn. Adoption was the easy part.
+Every MBB firm has its own AI assistant: Lilli at McKinsey, Deckster at BCG,
+Sage at Bain. BCG just crossed 90% employee adoption; McKinsey is past 75%. The
+dashboards say success. The partners know that's a vanity metric. We turn the
+session logs they already keep into the three answers no one else has: who to
+back, where to cut, and what the firm is collectively failing to learn.
+Adoption was the easy part.
 
 ## Target
 
@@ -22,15 +23,16 @@ manager, or Director of L&D.
 
 ## Solution
 
-### Dashboard (demo surface)
+### Dashboard (what we ship in 1 day)
 
-One view for partners and L&D. Shows the three answers at team and firm level.
-Individual-level access gated.
+A local dashboard for a partner or engagement manager to actually understand
+how their team uses AI. One screen, the three answers, no login.
 
-### Proxy + queue (in development)
+### Proxy + queue (the pipe behind it)
 
-A proxy sits in front of the firm's AI traffic, captures requests and responses,
-queues them for analysis. The ingestion and centralization layer.
+An LLM proxy in front of the firm's AI traffic captures requests and responses
+and feeds the dashboard. We run it locally against a seeded session log for the
+demo.
 
 ## Demo
 
@@ -52,15 +54,23 @@ Product, Uniqueness, AI use, Execution, Impact.
 
 - Pitch language (EN/FR).
 
-## Competition
+## Tools we build on
 
-- Bifrost: https://github.com/maximhq/bifrost (LLM gateway / proxy reference).
+The proxy/ingestion layer is solved territory. We pick one and put insights on
+top.
+
+- **LiteLLM** — most-deployed OSS LLM proxy. OpenAI-compatible, drop-in in
+  front of any provider, hooks for logging.
+- **Helicone** — observability-first proxy. Logs every request/response,
+  latency, cost. Closest in spirit to what we capture.
+- **Bifrost** (https://github.com/maximhq/bifrost) — high-perf gateway (~11μs
+  overhead at 5K RPS), semantic caching, failover, Prometheus metrics.
 
 ## References
 
-- [Rewiring the way McKinsey works with Lilli](https://www.mckinsey.com/capabilities/tech-and-ai/how-we-help-clients/rewiring-the-way-mckinsey-works-with-lilli)
-- [McKinsey rolls out Lilli to 7K employees (CIO Dive)](https://www.ciodive.com/news/McKinsey-generative-AI-Lilli-platform-internal-employees/691231/)
-- [Inside BCG's AI product assembly line](https://www.hackdiversity.com/inside-bcgs-ai-product-assembly-line/)
+- [Rewiring the way McKinsey works with Lilli](https://www.mckinsey.com/capabilities/tech-and-ai/how-we-help-clients/rewiring-the-way-mckinsey-works-with-lilli) — current >75% monthly active stat.
+- [McKinsey rolls out Lilli to 7K employees (CIO Dive)](https://www.ciodive.com/news/McKinsey-generative-AI-Lilli-platform-internal-employees/691231/) — initial rollout context.
+- [BCG execs: AI across the company increased productivity (Computerworld)](https://www.computerworld.com/article/3491334/bcg-execs-ai-across-the-company-increased-productivity-employee-joy.html)
 - [Nearly 90% of BCG employees are using AI (illuminem)](https://illuminem.com/illuminemvoices/nearly-90-of-bcg-employees-are-using-ai-and-its-reshaping-how-theyre-evaluated)
 - [Five ways Bain is leading with AI](https://www.bain.com/careers/life-at-bain/careers-blog/five-ways-bain-is-leading-with-ai/)
 - [Bain & Company AI deployments press release](https://www.bain.com/about/media-center/press-releases/2023/bain--company-makes-pioneering-deployments-of-state-of-the-art-ai-tools-worldwide/)
