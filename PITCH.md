@@ -1,44 +1,59 @@
 ## Problem
 
-Every MBB firm has its own AI assistant: Lilli at McKinsey, Deckster at BCG,
-Sage at Bain. BCG just crossed 90% employee adoption; McKinsey is past 75%. The
-dashboards say success. The partners know that's a vanity metric. We turn the
-session logs they already keep into the three answers no one else has: who to
-back, where to cut, and what the firm is collectively failing to learn. Adoption
-was the easy part.
+Tech companies are the largest buyers of AI today. Every engineer runs Claude
+Code, Cursor, Copilot, Devin, or an in-house agent — and many run several at
+once. AI spend has crossed "noticeable" and is heading for "biggest line item
+after payroll." The vendor dashboards say success: tokens up, sessions up,
+adoption up. The CTO knows that's a vanity metric. We turn the session logs
+the company already keeps into the three answers no one else has: who to back,
+where to cut, and what the engineering org is collectively failing to learn.
+Adoption was the easy part.
 
 ## Target
 
-Management consulting firms (MBB and tier-2). Buyer: partner, engagement
-manager, or Director of L&D.
+Tech companies whose engineers run AI agents at scale — Series-B and up, plus
+AI-native shops. Buyer: CTO, VP Engineering, or Head of Platform / AI
+Productivity. Strongest fit where Claude Code, Cursor, Copilot, Devin, or
+in-house coding agents are a meaningful per-engineer monthly spend.
 
 ## The three answers
 
-1. **Who to back.** Which consultants actually leverage AI vs. seat-fill.
-   Surface wizards, flag the stuck.
+1. **Who to back.** Which engineers actually leverage AI vs. seat-fill.
+   Surface wizards (people whose AI use compounds into shipped work), flag the
+   stuck.
 2. **Where to cut.** Wrong-model use, abandoned sessions, redundant prompts,
-   context bloat.
-3. **What the firm is collectively failing to learn.** Cluster retry-loops and
-   unresolved questions into a real-time capability-gap map.
+   context bloat, retry loops — the spend that produces nothing.
+3. **What the org is collectively failing to learn.** Cluster retry-loops and
+   unresolved questions into a real-time capability-gap map: which subsystems,
+   libraries, and patterns the team can't get the AI to nail.
 
 ## Solution
 
-### Dashboard (what we ship in 1 day)
+### Manager view (the showcase)
 
-A local dashboard for a partner or engagement manager to actually understand how
-their team uses AI. One screen, the three answers, no login.
+A single dashboard for a CTO or eng manager to actually understand how their
+team uses AI. One screen, the three answers, no login. Default landing: the
+non-tactical, leadership-grade view.
 
-### Proxy + queue (the pipe behind it)
+### Tech drilldown (one click deeper)
 
-An LLM proxy in front of the firm's AI traffic captures requests and responses
-and feeds the dashboard. We run it locally against a seeded session log for the
-demo.
+From any insight you can dig down into the underlying sessions, requests, and
+audit trail — full traceability and observability of every prompt, tool call,
+and token. Same product, audience-aware depth.
+
+### Proxy + analysis pipeline (the pipe behind it)
+
+An OpenAI-compatible LLM proxy sits in front of the company's AI traffic and
+captures every request/response. On session boundary it kicks an analysis job
+that scores the session, extracts asks/unresolved questions, flags waste, and
+updates the manager-facing intel. Single Docker container, one port.
 
 ## Demo
 
-Format: 90 seconds, live and interactive (no screen recording). Shape: a
-partner's morning. Three questions, three reveals from the dashboard, one kicker
-(firm-wide blindspot map).
+Format: 90 seconds, live and interactive (no screen recording). Shape: a CTO's
+Monday morning. Three questions, three reveals from the dashboard, one kicker
+(org-wide blindspot map). Optional cherry on top: drill from a wizard's profile
+straight into the actual session transcript.
 
 Open decisions:
 
@@ -68,14 +83,9 @@ top.
 
 ## References
 
-- [Rewiring the way McKinsey works with Lilli](https://www.mckinsey.com/capabilities/tech-and-ai/how-we-help-clients/rewiring-the-way-mckinsey-works-with-lilli)
-  — current >75% monthly active stat.
-- [McKinsey rolls out Lilli to 7K employees (CIO Dive)](https://www.ciodive.com/news/McKinsey-generative-AI-Lilli-platform-internal-employees/691231/)
-  — initial rollout context.
-- [BCG execs: AI across the company increased productivity (Computerworld)](https://www.computerworld.com/article/3491334/bcg-execs-ai-across-the-company-increased-productivity-employee-joy.html)
-- [Nearly 90% of BCG employees are using AI (illuminem)](https://illuminem.com/illuminemvoices/nearly-90-of-bcg-employees-are-using-ai-and-its-reshaping-how-theyre-evaluated)
-- [Five ways Bain is leading with AI](https://www.bain.com/careers/life-at-bain/careers-blog/five-ways-bain-is-leading-with-ai/)
-- [Bain & Company AI deployments press release](https://www.bain.com/about/media-center/press-releases/2023/bain--company-makes-pioneering-deployments-of-state-of-the-art-ai-tools-worldwide/)
+TODO: swap in tech-company AI-spend references (e.g. Claude Code / Cursor /
+Copilot adoption stats, dev productivity studies). The MBB references that
+seeded the original framing have been removed — they no longer match the ICP.
 
 ## Feedback
 
@@ -92,7 +102,6 @@ top.
 ### TODO
 
 - what is our competition?
-- change target audience to code/tech companies
 - include "productive" distribution in the spend flow
 - unite the dashboard with the ui/ and backend
 - ask
@@ -100,3 +109,4 @@ top.
 ## Future
 
 - Session satisfaction
+- Pool agent sessions instead of a session per use

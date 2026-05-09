@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./insights/insights.css";
 
 @theme {
   /* Soft-pop neobrutalist palette */

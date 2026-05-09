@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { db } from "./db.js";
 import { listConfiguredProviders, PROVIDERS } from "./providers.js";
+import { insightsApi } from "./insights/api.js";
 
 export const api = new Hono();
 
@@ -651,3 +652,5 @@ function emitMessageBlocks(args: EmitArgs): void {
     }
   }
 }
+
+api.route("/", insightsApi);
