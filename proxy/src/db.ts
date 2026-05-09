@@ -47,6 +47,14 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_requests_started ON requests(started_at DESC);
   CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
   CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+
+  CREATE TABLE IF NOT EXISTS seed_imports (
+    file_path TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    imported_at INTEGER NOT NULL,
+    session_count INTEGER NOT NULL,
+    request_count INTEGER NOT NULL
+  );
 `);
 
 const upsertSessionStmt = db.prepare(`
