@@ -1,0 +1,24 @@
+services:
+  nebula:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nebula:local
+    container_name: nebula
+    ports:
+      - "${NEBULA_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      NEBULA_DB_PATH: /data/nebula.db
+    volumes:
+      - nebula-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  nebula-data:

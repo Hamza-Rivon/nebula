@@ -1,0 +1,199 @@
+@import "tailwindcss";
+
+@theme {
+  /* Soft-pop neobrutalist palette */
+  --color-paper:    #FFFBF2;   /* warm cream background */
+  --color-ink:      #111111;   /* near-black for borders + type */
+  --color-mist:     #F2EEE0;   /* surface tint */
+  --color-mint:     #B8F5C9;
+  --color-peach:    #FFB7A8;
+  --color-lavender: #C8B6FF;
+  --color-butter:   #FFE066;
+  --color-sky:      #A0E7FF;
+  --color-rose:     #FF8FB1;
+  --color-lime:     #DEFF6B;
+
+  /* Status */
+  --color-ok:    #4FCB6B;
+  --color-warn:  #FFB54E;
+  --color-err:   #FF5C5C;
+
+  --font-display: "Space Grotesk", system-ui, sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, monospace;
+
+  --radius-soft: 14px;
+  --radius-pill: 999px;
+}
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-display);
+  -webkit-font-smoothing: antialiased;
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(17,17,17,0.06) 1px, transparent 0);
+  background-size: 22px 22px;
+}
+
+/* Neobrutalist primitives */
+.nb-card {
+  background: #FFFFFF;
+  border: 3px solid var(--color-ink);
+  border-radius: var(--radius-soft);
+  box-shadow: 6px 6px 0 0 var(--color-ink);
+}
+.nb-card-flat {
+  background: #FFFFFF;
+  border: 3px solid var(--color-ink);
+  border-radius: var(--radius-soft);
+}
+.nb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .55rem 1rem;
+  border: 3px solid var(--color-ink);
+  border-radius: var(--radius-soft);
+  background: var(--color-butter);
+  font-weight: 600;
+  box-shadow: 4px 4px 0 0 var(--color-ink);
+  transition: transform 80ms ease, box-shadow 80ms ease, background 120ms ease;
+  cursor: pointer;
+  user-select: none;
+}
+.nb-btn:hover { background: var(--color-lime); }
+.nb-btn:active {
+  transform: translate(4px, 4px);
+  box-shadow: 0 0 0 0 var(--color-ink);
+}
+.nb-btn[data-variant="ghost"] {
+  background: transparent;
+  box-shadow: none;
+  border-color: transparent;
+}
+.nb-btn[data-variant="ghost"]:hover {
+  background: var(--color-mist);
+  border-color: var(--color-ink);
+  box-shadow: 4px 4px 0 0 var(--color-ink);
+}
+.nb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .15rem .6rem;
+  border: 2px solid var(--color-ink);
+  border-radius: var(--radius-pill);
+  font-size: .72rem;
+  font-weight: 600;
+  background: #fff;
+}
+.nb-input {
+  width: 100%;
+  padding: .55rem .8rem;
+  border: 3px solid var(--color-ink);
+  border-radius: var(--radius-soft);
+  background: #fff;
+  font-family: var(--font-display);
+  font-size: .95rem;
+}
+.nb-input:focus {
+  outline: none;
+  box-shadow: 4px 4px 0 0 var(--color-ink);
+  transform: translate(-2px, -2px);
+}
+.nb-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.nb-table th {
+  text-align: left;
+  font-size: .72rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: .6rem .8rem;
+  border-bottom: 3px solid var(--color-ink);
+  background: var(--color-mist);
+}
+.nb-table td {
+  padding: .7rem .8rem;
+  border-bottom: 2px solid #1111111A;
+  font-size: .9rem;
+  vertical-align: top;
+}
+.nb-table tbody tr { cursor: pointer; transition: background 80ms ease; }
+.nb-table tbody tr:hover { background: #FFF7DA; }
+
+.nb-tag {
+  display: inline-block;
+  padding: .12rem .5rem;
+  border: 2px solid var(--color-ink);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: .72rem;
+  background: #fff;
+}
+
+.scrollbar-soft::-webkit-scrollbar { width: 10px; height: 10px; }
+.scrollbar-soft::-webkit-scrollbar-thumb {
+  background: var(--color-ink);
+  border-radius: 999px;
+  border: 2px solid var(--color-paper);
+}
+
+/* Hover lift / tilt for interactive cards */
+.nb-hover {
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+.nb-hover:hover {
+  transform: translate(-2px, -2px) rotate(-0.6deg);
+  box-shadow: 9px 9px 0 0 var(--color-ink);
+}
+
+/* New row flash highlight */
+@keyframes nb-flash {
+  0%   { background: var(--color-butter); }
+  60%  { background: var(--color-butter); }
+  100% { background: transparent; }
+}
+.nb-flash {
+  animation: nb-flash 600ms ease-out;
+}
+
+/* Subtle pulse for "live" dots */
+@keyframes nb-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50%      { transform: scale(1.35); opacity: .55; }
+}
+.nb-pulse { animation: nb-pulse 1.6s ease-in-out infinite; }
+
+/* Slide-in for new feed rows */
+@keyframes nb-slide-in {
+  0%   { transform: translateY(-6px); opacity: 0; }
+  100% { transform: translateY(0); opacity: 1; }
+}
+.nb-slide-in { animation: nb-slide-in 380ms ease-out; }
+
+/* Recharts axis text styling -- match brand */
+.recharts-text, .recharts-cartesian-axis-tick-value {
+  font-family: var(--font-display);
+  font-size: 11px;
+  fill: var(--color-ink);
+  font-weight: 600;
+}
+.recharts-default-tooltip {
+  border: 3px solid var(--color-ink) !important;
+  border-radius: 10px !important;
+  box-shadow: 4px 4px 0 0 var(--color-ink) !important;
+  background: #fff !important;
+  font-family: var(--font-display) !important;
+}
+.recharts-cartesian-axis-line, .recharts-cartesian-axis-tick-line {
+  stroke: var(--color-ink);
+  stroke-width: 2;
+}
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke: rgba(17,17,17,0.12);
+}

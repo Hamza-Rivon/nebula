@@ -1,0 +1,9 @@
+**/node_modules
+**/dist
+**/ui-dist
+**/.vite
+**/data
+**/.env
+**/.env.local
+**/.git
+**/.DS_Store
