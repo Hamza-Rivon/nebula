@@ -126,22 +126,22 @@ why you and not the competition?
 
 ## Pitch
 ### Opening
-Our CTO spent 3'000$ on credits this month. A third of it was wasted.
-
-(Agents are becoming more and more used in tech companies, and many managers and CTOs still do not know whether they are improving efficiency or just burning tokens)
+Our CTO spent 3'000$ on credits this month. 20% of it was wasted.  
 
 ### Problem
-High adoption does not mean efficiency.
-The efficiency of these agents depend on how the users use them.
+Agents are becoming more and more used in tech companies, and many managers and CTOs still do not know whether they are improving efficiency or just burning tokens.  
+
+High adoption does not mean efficiency.  
+Efficiency depends on how the ai is used.  
 
 ### Solution
-We built a B2B solution that extracts insightful data from the conversations themselves and points out how employees are using ai.
-Managers can then take action to improve their employees' performances and waste less tokens.
+We built a B2B solution that analyzes the conversations employees have with ai.  
+Managers then take action to improve their employees' performances and reduse ai costs.  
 
 ### Demo
-The app works with a proxy listing all llm conversations
+The app works with a proxy listing all llm conversations  
 
-Then the conversations are analyzed by our models and insights are extracted.
+Then the conversations are analyzed by our models and insights are extracted.  
 
 ### Conclusion
-Adoption was easy; we build what comes next.
+Adoption was easy; we build what comes next.  
