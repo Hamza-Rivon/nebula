@@ -51,6 +51,10 @@ const port = Number(process.env.NEBULA_PROXY_PORT ?? 8080);
 const server = Bun.serve({
   port,
   hostname: "0.0.0.0",
+  // 0 = no idle timeout. SSE (/api/events) holds connections open
+  // indefinitely, and LLM streaming proxies routinely take >10s between
+  // chunks; the default 10s would kill both.
+  idleTimeout: 0,
   fetch: app.fetch,
 });
 console.log(`✦ Nebula proxy listening on http://${server.hostname}:${server.port}`);

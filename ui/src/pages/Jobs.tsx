@@ -7,7 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { EmptyState } from "../components/EmptyState";
 import { fmt } from "../format";
-import { jobsInfiniteQuery, jobsListQuery, qk } from "../queries";
+import { jobsInfiniteQuery, jobsListQuery, qk, settingsQuery } from "../queries";
 import { useInfiniteScroll } from "../useInfiniteScroll";
 import { insightsApi } from "../insights/api";
 import type { Job } from "../insights/types";
@@ -79,6 +79,29 @@ export function JobsPage() {
   // the page is filtered down to a slice.
   const queuedOrRunning = (counts.queued ?? 0) + (counts.running ?? 0);
 
+  // Persistent toggle controlling whether captured sessions auto-process.
+  // Optimistic update on the cache so the switch flips instantly; the PUT
+  // request reconciles in the background and an SSE-driven invalidate
+  // covers any stale state.
+  const settings = useQuery(settingsQuery());
+  const autoDrain = settings.data?.autoDrain ?? true;
+  const autoDrainMut = useMutation({
+    mutationFn: (v: boolean) => insightsApi.setAutoDrain(v),
+    onMutate: async (v) => {
+      await qc.cancelQueries({ queryKey: qk.settings });
+      const prev = qc.getQueryData<{ autoDrain: boolean }>(qk.settings);
+      qc.setQueryData<{ autoDrain: boolean }>(qk.settings, { autoDrain: v });
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(qk.settings, ctx.prev);
+      alert("Failed to update auto-drain setting");
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.jobs.root });
+    },
+  });
+
   const startAnalyze = useMutation({
     mutationFn: () => insightsApi.postAnalyze({ all: true }),
     onSuccess: () => {
@@ -109,7 +132,12 @@ export function JobsPage() {
             {fmt.num(queuedOrRunning)} in flight
           </span>
         )}
-        <div className="ml-auto flex gap-2">
+        <div className="ml-auto flex items-center gap-3">
+          <AutoDrainToggle
+            value={autoDrain}
+            onChange={(v) => autoDrainMut.mutate(v)}
+            pending={autoDrainMut.isPending}
+          />
           <button
             type="button"
             className="nb-btn"
@@ -449,4 +477,76 @@ function msLabel(ms: number): string {
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   if (ms < 3_600_000) return `${(ms / 60_000).toFixed(1)}m`;
   return `${(ms / 3_600_000).toFixed(1)}h`;
+}
+
+// Persistent on/off control for auto-draining the analyze queue. Default
+// ON: captured live requests auto-enqueue AND auto-run. OFF: queue grows
+// passively until the manager flips it back on (or runs "Re-analyze all").
+function AutoDrainToggle({
+  value,
+  onChange,
+  pending,
+}: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+  pending: boolean;
+}) {
+  const id = "auto-drain-toggle";
+  return (
+    <label
+      htmlFor={id}
+      className="flex items-center gap-2 select-none"
+      style={{ cursor: pending ? "wait" : "pointer" }}
+      title={
+        value
+          ? "Captured sessions auto-process as soon as they arrive."
+          : "Captured sessions queue up but don't run until you flip this on."
+      }
+    >
+      <span className="text-xs font-bold uppercase tracking-widest opacity-70">
+        Auto-drain
+      </span>
+      <span
+        className="relative inline-block"
+        style={{
+          width: 36,
+          height: 20,
+          background: value ? "var(--color-mint)" : "var(--color-mist)",
+          border: "2px solid var(--color-ink)",
+          borderRadius: 999,
+          transition: "background 0.15s",
+        }}
+      >
+        <span
+          style={{
+            position: "absolute",
+            top: 1,
+            left: value ? 17 : 1,
+            width: 14,
+            height: 14,
+            background: "var(--color-ink)",
+            borderRadius: 999,
+            transition: "left 0.15s",
+          }}
+        />
+      </span>
+      <input
+        id={id}
+        type="checkbox"
+        checked={value}
+        disabled={pending}
+        onChange={(e) => onChange(e.target.checked)}
+        style={{ position: "absolute", opacity: 0, pointerEvents: "none" }}
+      />
+      <span
+        className="text-[11px] mono"
+        style={{
+          color: value ? "var(--color-ok)" : "var(--color-ink)",
+          opacity: value ? 1 : 0.6,
+        }}
+      >
+        {value ? "on" : "off"}
+      </span>
+    </label>
+  );
 }

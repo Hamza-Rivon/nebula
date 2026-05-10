@@ -1,11 +1,18 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { EmptyState } from "../components/EmptyState";
 import { MetricChips } from "../components/MetricChips";
 import { fmt } from "../format";
+import { api } from "../api";
 import {
   flattenSessions,
+  qk,
   sessionsAggQuery,
   sessionsListQuery,
 } from "../queries";
@@ -45,6 +52,23 @@ export function SessionsPage() {
   const navigate = useNavigate();
   const goToSession = (id: string) =>
     navigate(`/sessions/${encodeURIComponent(id)}`);
+
+  // Destructive: deletes the session row, its requests, the analyzed
+  // SessionMeta, transcript, extract cache, and any analyze_jobs scoped
+  // to it. Confirm to keep accidental row clicks safe.
+  const qc = useQueryClient();
+  const deleteSessionMut = useMutation({
+    mutationFn: (id: string) => api.deleteSession(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.sessions.root });
+      qc.invalidateQueries({ queryKey: qk.requests.root });
+      qc.invalidateQueries({ queryKey: qk.users.root });
+      qc.invalidateQueries({ queryKey: qk.insights.root });
+      qc.invalidateQueries({ queryKey: qk.jobs.root });
+      qc.invalidateQueries({ queryKey: qk.stats });
+    },
+    onError: (e) => alert(`Failed to delete session: ${String(e)}`),
+  });
 
   return (
     <div className="space-y-4">
@@ -123,6 +147,7 @@ export function SessionsPage() {
               <th className="text-right">Tokens</th>
               <th className="text-right">Cost</th>
               <th>Last activity</th>
+              <th className="text-right">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -152,11 +177,42 @@ export function SessionsPage() {
                 <td>
                   <span className="opacity-80">{fmt.rel(s.updated_at)}</span>
                 </td>
+                <td
+                  className="text-right"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    className="nb-chip"
+                    disabled={
+                      deleteSessionMut.isPending &&
+                      deleteSessionMut.variables === s.id
+                    }
+                    onClick={() => {
+                      if (
+                        confirm(
+                          `Delete session "${s.id}" and its ${s.request_count} request${s.request_count === 1 ? "" : "s"}? This cannot be undone.`,
+                        )
+                      ) {
+                        deleteSessionMut.mutate(s.id);
+                      }
+                    }}
+                    title="Delete this session and everything tied to it"
+                    style={{ cursor: "pointer" }}
+                    aria-label="delete"
+                  >
+                    <TrashIcon />
+                    {deleteSessionMut.isPending &&
+                    deleteSessionMut.variables === s.id
+                      ? "…"
+                      : "delete"}
+                  </button>
+                </td>
               </tr>
             ))}
             {!loading && !rows.length && (
               <tr>
-                <td colSpan={6}>
+                <td colSpan={7}>
                   <EmptyState
                     title="No sessions match"
                     hint="Adjust the filters or send a fresh request to /v1/chat/completions."
@@ -168,7 +224,7 @@ export function SessionsPage() {
             )}
             {!done && rows.length > 0 && (
               <tr>
-                <td colSpan={6} className="table-loadmore">
+                <td colSpan={7} className="table-loadmore">
                   <div ref={sentinelRef} className="infinite-sentinel" />
                   {loading ? "loading more…" : `${rows.length} of ${total} loaded`}
                 </td>
@@ -178,5 +234,25 @@ export function SessionsPage() {
         </table>
       </div>
     </div>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width="11"
+      height="11"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      aria-hidden
+    >
+      <path
+        d="M3 4h10M6.5 4V2.5h3V4M5 4v9.5a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1V4M7 7v5M9 7v5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }

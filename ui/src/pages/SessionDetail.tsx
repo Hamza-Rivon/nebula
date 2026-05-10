@@ -933,7 +933,7 @@ function InsightsBanner({ sessionId }: { sessionId: string }) {
         </span>
         {meta.wasteUsd > 0 && (
           <span className="nb-chip" style={{ background: "var(--color-rose)" }}>
-            {fmt.cost(meta.wasteUsd)} flagged waste
+            {fmt.cost(meta.wasteUsd)} exposure
           </span>
         )}
       </div>

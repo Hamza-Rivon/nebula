@@ -135,7 +135,7 @@ export function T1Insights({ handle }: { handle: InsightsHandle }) {
     }
     if (drawer.kind === "waste") {
       return {
-        eyebrow: "Waste category",
+        eyebrow: "Exposure pattern",
         title: wasteTypeLabel(drawer.wasteType),
         subtitle: "Detected pattern across the org",
         body: (
@@ -164,8 +164,8 @@ export function T1Insights({ handle }: { handle: InsightsHandle }) {
     return (
       <div className="nb-card p-5">
         {inFlight > 0
-          ? `Analyzing capability intel — ${inFlight} session task${inFlight === 1 ? "" : "s"} in flight…`
-          : "Loading capability intel…"}
+          ? `Analyzing capability brief — ${inFlight} session task${inFlight === 1 ? "" : "s"} in flight…`
+          : "Loading capability brief…"}
       </div>
     );
   }
@@ -192,7 +192,7 @@ export function T1Insights({ handle }: { handle: InsightsHandle }) {
       )}
       <div className="page-head">
         <div>
-          <div className="page-eyebrow">Capability intel · CTO brief</div>
+          <div className="page-eyebrow">Capability brief</div>
           <h1 className="page-title">Insights overview</h1>
         </div>
         <div className="page-head-controls">

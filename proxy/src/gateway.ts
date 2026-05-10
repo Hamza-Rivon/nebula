@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { nanoid } from "nanoid";
-import { ensureSession, recordRequest } from "./db.js";
+import { ensureSession, ensureUser, recordRequest } from "./db.js";
 import {
   parseModel,
   getProviders,
@@ -53,6 +53,11 @@ gateway.post("/v1/messages", async (c) => {
     nanoid();
   const userId =
     c.req.header("x-nebula-user") ?? body.metadata?.user_id ?? null;
+  // Register the user the moment we see the header — before any validation
+  // gate. A request that errors here (missing model, bad provider, no API
+  // key) would otherwise never reach `ensureSession` / `recordRequest`,
+  // and the user would silently never appear in the Users tab.
+  if (userId) ensureUser(userId);
   const stream = body.stream === true;
 
   if (!body.model || typeof body.model !== "string") {
@@ -238,6 +243,7 @@ gateway.post("/v1/chat/completions", async (c) => {
     nanoid();
   const userId =
     c.req.header("x-nebula-user") ?? body.user ?? body.metadata?.user_id ?? null;
+  if (userId) ensureUser(userId);
 
   if (!body.model || typeof body.model !== "string") {
     return c.json({ error: { message: "model is required" } }, 400);

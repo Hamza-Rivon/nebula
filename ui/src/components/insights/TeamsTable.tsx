@@ -110,7 +110,7 @@ export function TeamsTable({ data, onOpenTeam }: Props) {
                 Spend <span className="sort-arrow">{arrow("spend")}</span>
               </th>
               <th onClick={() => handleSort("waste")} className="sortable right">
-                Waste <span className="sort-arrow">{arrow("waste")}</span>
+                Exposure <span className="sort-arrow">{arrow("waste")}</span>
               </th>
               <th onClick={() => handleSort("costPerWin")} className="sortable right">
                 $/win <span className="sort-arrow">{arrow("costPerWin")}</span>

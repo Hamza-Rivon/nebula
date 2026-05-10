@@ -73,7 +73,7 @@ export function MoneyFlow({
     const nodes: NodeDatum[] = [
       { key: "total", label: "Total spend", category: "total" },
       { key: "productive", label: "Productive", category: "productive" },
-      { key: "wasted", label: "Wasted", category: "wasted" },
+      { key: "wasted", label: "Exposure", category: "wasted" },
     ];
     const links: LinkDatum[] = [
       {
@@ -117,7 +117,7 @@ export function MoneyFlow({
   }, []);
 
   const splitsCount = graph.nodes.filter((n) => n.category === "split").length;
-  const height = Math.max(320, splitsCount * 38 + 80);
+  const height = Math.max(360, splitsCount * 56 + 96);
 
   const layout = useMemo(() => {
     if (total <= 0 || width <= 0) return null;
@@ -137,7 +137,7 @@ export function MoneyFlow({
 
     const sk = makeSankey<NodeDatum, LinkDatum>()
       .nodeWidth(20)
-      .nodePadding(14)
+      .nodePadding(26)
       .nodeAlign(sankeyLeft)
       .extent([
         [16, 16],
@@ -322,7 +322,7 @@ function NodeLabel({
           fontWeight={700}
           style={{ letterSpacing: "0.18em", textTransform: "uppercase" }}
         >
-          {isWaste ? "Wasted" : "Productive"}
+          {isWaste ? "Exposure" : "Productive"}
         </text>
         <text
           x={x1 + 10}

@@ -48,27 +48,16 @@ function invalidateForReconnect(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ["heatmap"] });
 }
 
-// Job events carry the full row, so we patch the cache directly — no extra
-// HTTP roundtrip — and the Jobs page updates instantly. We also patch the
-// per-id detail key for the analyze polling in Layout.
+// Job events fire fast during a fan-out (1k+ session tasks → 1k+ status
+// transitions). We used to patch `qk.jobs.list` and `qk.jobs.detail` in
+// place per event; with the page now using paged / infinite queries, those
+// keys aren't read anywhere — but the cumulative O(N log N) sort inside
+// each setQueryData froze the browser during a manual "Re-analyze all".
+// Keep only the small, useful patches: the Layout sidebar progress chip
+// (which polls `["jobs", id]`) and the dataset invalidate on rollup-done.
+// Everything else flows through the throttled `qk.jobs.root` invalidate.
 function applyJobEvent(qc: QueryClient, job: LiveJob): void {
-  qc.setQueryData<Job>(qk.jobs.detail(job.id), job as Job);
-  qc.setQueryData<{ jobs: Job[] } | undefined>(
-    qk.jobs.list,
-    (prev) => {
-      const next = prev?.jobs ? [...prev.jobs] : [];
-      const idx = next.findIndex((j) => j.id === job.id);
-      if (idx >= 0) next[idx] = job as Job;
-      else next.unshift(job as Job);
-      // Recent first; mirrors `selectRecentStmt` ORDER BY started_at DESC.
-      next.sort((a, b) => b.started_at - a.started_at);
-      return { jobs: next };
-    },
-  );
-  // The Layout polls a single ["jobs", id] key for the active analyze; keep
-  // it in sync too so the sidebar progress chip updates without polling.
   qc.setQueryData<Job | null>(["jobs", job.id], job as Job);
-  // When an analyze pass terminates, the dataset has changed.
   if (job.status === "done") {
     qc.invalidateQueries({ queryKey: qk.insights.root });
   }
@@ -107,11 +96,6 @@ function applySessionAnalyzedEvent(qc: QueryClient, raw: unknown): void {
 }
 
 function applyJobDeletedEvent(qc: QueryClient, id: string): void {
-  qc.setQueryData<{ jobs: Job[] } | undefined>(qk.jobs.list, (prev) => {
-    if (!prev?.jobs) return prev;
-    return { jobs: prev.jobs.filter((j) => j.id !== id) };
-  });
-  qc.removeQueries({ queryKey: qk.jobs.detail(id), exact: true });
   qc.removeQueries({ queryKey: ["jobs", id], exact: true });
 }
 
@@ -149,6 +133,15 @@ export function useLiveBridge(): void {
       }
       if (e.type === "job_deleted") {
         applyJobDeletedEvent(qc, e.id);
+        if (!jobInvalidatePendingRef.current) {
+          jobInvalidatePendingRef.current = true;
+          jobInvalidateTimerRef.current = window.setTimeout(flushJobs, THROTTLE_MS);
+        }
+        return;
+      }
+      if (e.type === "jobs_bulk_changed") {
+        // Single throttled invalidate covers the fan-out. Replaces the old
+        // per-row event storm that froze the browser.
         if (!jobInvalidatePendingRef.current) {
           jobInvalidatePendingRef.current = true;
           jobInvalidateTimerRef.current = window.setTimeout(flushJobs, THROTTLE_MS);

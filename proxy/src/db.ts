@@ -82,6 +82,18 @@ db.exec(`
     session_count INTEGER NOT NULL,
     request_count INTEGER NOT NULL
   );
+
+  -- Per-file → session_id mapping with cascade. When a session is deleted via
+  -- the API, its links vanish; the seed pass uses link presence to decide
+  -- whether to skip a file or re-import it. Without this, deleting a session
+  -- in the UI leaves a stale seed_imports row that masks the file forever.
+  CREATE TABLE IF NOT EXISTS seed_session_links (
+    file_path TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (file_path, session_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_seed_links_session ON seed_session_links(session_id);
 `);
 
 // Idempotent migrations for existing volumes. SQLite has no
@@ -123,6 +135,23 @@ db.exec(`
       `ALTER TABLE sessions ADD COLUMN total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
     );
   }
+
+  // Heal stale seed_imports rows. If a row claims it produced sessions but
+  // none of those sessions still exist (or no link rows back the claim), the
+  // cache is lying — drop the row so the next seed pass re-imports the file.
+  // This handles two cases at once:
+  //   1) Pre-link history: rows written before seed_session_links existed have
+  //      zero links — wipe them and let the next pass repopulate cleanly.
+  //   2) Post-link drift: a session was deleted via the API → CASCADE removed
+  //      its link row → the seed_imports row now has no surviving links.
+  db.exec(`
+    DELETE FROM seed_imports
+    WHERE session_count > 0
+      AND NOT EXISTS (
+        SELECT 1 FROM seed_session_links sl
+        WHERE sl.file_path = seed_imports.file_path
+      )
+  `);
 }
 
 const upsertSessionStmt = db.prepare(`
@@ -184,6 +213,52 @@ export type CapturedRequest = {
 
 export function ensureSession(id: string, user_id: string | null): void {
   upsertSessionStmt.run(np({ id, user_id, now: Date.now() }));
+  // Mirror the user_id into the users registry so they show up in the
+  // Users tab even before their first captured request — important when
+  // an early validation gate (missing model, bad provider, no API key)
+  // fails before recordRequest is ever called.
+  if (user_id) ensureUser(user_id);
+}
+
+// =============================================================================
+// Users registry. Distinct from `requests.user_id` / `sessions.user_id`: this
+// is the durable list of every user_id we've ever seen, registered the moment
+// the gateway parses the `x-nebula-user` header. Lets the Users tab list a
+// user whose only request errored at validation (so no row in requests/
+// sessions ever existed). NULL user_ids are intentionally NOT registered
+// here — anonymous traffic stays as a derived bucket from the requests
+// groupby.
+// =============================================================================
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL
+  );
+`);
+
+const upsertUserStmt = db.prepare(`
+  INSERT INTO users (user_id, first_seen, last_seen) VALUES (?, ?, ?)
+  ON CONFLICT(user_id) DO UPDATE SET last_seen = excluded.last_seen
+`);
+
+export function ensureUser(user_id: string): void {
+  if (!user_id) return;
+  const now = Date.now();
+  upsertUserStmt.run(user_id, now, now);
+}
+
+// Registration hook for the analyze queue. The insights/jobs module wires
+// itself up at startup so that every captured request triggers an idempotent
+// session-task enqueue. Lives here (not in events.ts) because it carries
+// structured ids; events.ts is the SSE wire-format bus, not an in-process
+// pub/sub. Callers must tolerate the hook being null (boot ordering).
+let onRequestRecorded: ((sessionId: string) => void) | null = null;
+export function setOnRequestRecorded(
+  fn: ((sessionId: string) => void) | null,
+): void {
+  onRequestRecorded = fn;
 }
 
 export function recordRequest(req: CapturedRequest): void {
@@ -219,4 +294,12 @@ export function recordRequest(req: CapturedRequest): void {
     started_at: req.started_at,
     finished_at: req.finished_at,
   });
+  // Auto-enqueue an analyze task for this session. Hook is null until
+  // jobs.ts boots, which is fine — early proxy traffic just doesn't get
+  // queued (the next request on the same session will).
+  try {
+    onRequestRecorded?.(req.session_id);
+  } catch {
+    // Never let the queue subsystem break a successful request capture.
+  }
 }

@@ -41,6 +41,13 @@ export type LiveEvent =
     }
   | { type: "job"; job: LiveJob }
   | { type: "job_deleted"; id: string }
+  // Emitted when many job rows change at once (e.g. an "all" fan-out
+  // inserts 1k+ session tasks). UI clients treat this as a single
+  // throttled invalidate so they don't get hit with 1k individual job
+  // events back-to-back, which froze the page during a manual
+  // "Re-analyze all". Per-row `job` events still fire for status
+  // transitions on already-running tasks.
+  | { type: "jobs_bulk_changed"; count: number }
   // Emitted whenever a per-session analyze task finishes a write. Carries
   // the freshly persisted SessionMeta JSON so UI clients can patch the
   // Insights dataset cache in place — no full refetch per session.

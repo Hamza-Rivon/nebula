@@ -1,6 +1,11 @@
 import { Link, useNavigate } from "react-router-dom";
 import type { Dataset, SessionMeta, User } from "../../../insights/types";
 import { formatDate, formatUsd } from "../../../insights/format";
+import {
+  BUCKET_META,
+  sessionRiskBucket,
+  sessionRiskScore,
+} from "../../../insights/risk";
 import { Avatar } from "../Avatar";
 
 interface Props {
@@ -46,7 +51,7 @@ export function UserDrawer({ user, data }: Props) {
         />
         <Stat label="Spend" value={formatUsd(user.totalCostUsd, { decimals: 0 })} />
         <Stat
-          label="Waste"
+          label="Exposure"
           value={formatUsd(user.totalWasteUsd, { decimals: 0 })}
           tone={user.totalWasteUsd > 0 ? "warn" : undefined}
         />
@@ -235,14 +240,30 @@ function SessionRow({ s }: { s: SessionMeta }) {
           <div className="mono text-sm">
             {formatUsd(s.costUsd, { decimals: 1 })}
           </div>
-          {s.wasteUsd > 0 && (
-            <div className="mono text-[11px] warm">
-              {formatUsd(s.wasteUsd, { decimals: 1 })} wasted
-            </div>
-          )}
+          <RiskChip session={s} />
         </div>
       </Link>
     </li>
+  );
+}
+
+// Forensics-style chip: clean / watch / flag / audit. Replaces the bare
+// "$X wasted" line so a single low-confidence dollar number doesn't look
+// like an audited fact in the manager's drawer. Score is hidden on idle
+// (just the label) and revealed on hover via title — keeps the row calm.
+function RiskChip({ session }: { session: SessionMeta }) {
+  const bucket = sessionRiskBucket(session);
+  if (bucket === "clean") return null;
+  const meta = BUCKET_META[bucket];
+  const score = sessionRiskScore(session);
+  return (
+    <div
+      className="nb-chip mono text-[10px]"
+      style={{ background: meta.bg, color: meta.fg, marginTop: 2 }}
+      title={`risk score ${score} · ${formatUsd(session.wasteUsd, { decimals: 2 })} exposure of ${formatUsd(session.costUsd, { decimals: 2 })}`}
+    >
+      {meta.label}
+    </div>
   );
 }
 

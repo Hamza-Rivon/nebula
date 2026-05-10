@@ -76,6 +76,8 @@ export const qk = {
     dataset: ["insights", "dataset"] as const,
   },
 
+  settings: ["settings"] as const,
+
   search: (q: string) => ["search", q] as const,
 } as const;
 
@@ -298,6 +300,12 @@ export const insightsDatasetQuery = () =>
 // ---------------------------------------------------------------------------
 // Jobs (analyze queue) — pushed live via SSE; fetched on mount + invalidate.
 // ---------------------------------------------------------------------------
+
+export const settingsQuery = () =>
+  queryOptions<{ autoDrain: boolean }>({
+    queryKey: qk.settings,
+    queryFn: () => insightsApi.getSettings(),
+  });
 
 export const jobsListQuery = (params?: {
   scopePrefix?: string;

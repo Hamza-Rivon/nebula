@@ -18,7 +18,9 @@ import {
   jobCounts,
   listJobs,
   listJobsFiltered,
+  runQueue,
 } from "./jobs.js";
+import { getAutoDrain, setAutoDrain } from "../settings.js";
 
 export const insightsApi = new Hono();
 
@@ -75,6 +77,32 @@ insightsApi.get("/jobs", (c) => {
 
 insightsApi.get("/jobs/stats", (c) => {
   return c.json({ counts: jobCounts() });
+});
+
+// Persisted app settings. Currently just `autoDrain`: whether the analyze
+// queue auto-processes session tasks the moment they're enqueued from the
+// gateway. ON by default (a fresh container "just works"); managers can
+// flip it to OFF to triage manually.
+insightsApi.get("/settings", (c) => {
+  return c.json({ autoDrain: getAutoDrain() });
+});
+
+insightsApi.put("/settings", async (c) => {
+  let body: { autoDrain?: unknown } = {};
+  try {
+    body = (await c.req.json()) as typeof body;
+  } catch {
+    body = {};
+  }
+  if (typeof body.autoDrain === "boolean") {
+    const wasOff = !getAutoDrain();
+    setAutoDrain(body.autoDrain);
+    // Flipping OFF → ON drains the backlog immediately. Workers already
+    // running are unaffected; new auto-enqueues from the gateway start
+    // kicking workers as before.
+    if (body.autoDrain && wasOff) runQueue();
+  }
+  return c.json({ autoDrain: getAutoDrain() });
 });
 
 // Cancel a queued or running job. Idempotent against terminal rows: hitting

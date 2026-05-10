@@ -25,14 +25,14 @@ export function WasteDrawer({ wasteType, data, anonymized }: Props) {
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-3 gap-2">
-        <Stat label="USD wasted" value={formatUsd(meta.usd, { decimals: 0 })} tone="warn" />
+        <Stat label="Exposure" value={formatUsd(meta.usd, { decimals: 0 })} tone="warn" />
         <Stat label="Sessions" value={String(meta.sessions)} />
         <Stat label="Tokens" value={String(meta.tokens.toLocaleString())} />
       </div>
 
       <div>
         <div className="mb-2 text-sm opacity-70">
-          Pattern: <strong>{wasteTypeLabel(wasteType)}</strong>. Top burning
+          Pattern: <strong>{wasteTypeLabel(wasteType)}</strong>. Top exposed
           sessions:
         </div>
         <ul className="space-y-2">

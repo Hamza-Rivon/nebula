@@ -1,6 +1,7 @@
 import { nanoid } from "nanoid";
-import { db, np } from "../db.js";
+import { db, np, setOnRequestRecorded } from "../db.js";
 import { publishEvent } from "../events.js";
+import { getAutoDrain } from "../settings.js";
 import {
   analyzeOneSession,
   runRollup,
@@ -112,6 +113,14 @@ const claimQueuedRollupStmt = db.prepare(
 const countQueuedSessionsStmt = db.prepare(
   `SELECT COUNT(*) AS n FROM analyze_jobs
     WHERE status IN ('queued', 'running') AND scope LIKE 'session:%'`,
+);
+// Queued-only count (no running). kickWorkers uses this to avoid spinning
+// up phantom workers that would pin activeSessionWorkers to MAX_WORKERS
+// for one event-loop tick while their .finally decrements are still queued
+// as microtasks — that's the race that wedged the boot path.
+const countQueuedSessionsOnlyStmt = db.prepare(
+  `SELECT COUNT(*) AS n FROM analyze_jobs
+    WHERE status = 'queued' AND scope LIKE 'session:%'`,
 );
 
 // Live status priority for the queue table: running > queued > done >
@@ -302,22 +311,55 @@ function enqueueAll(force: boolean): Job {
 
   const rollupScope = force ? "rollup+force" : "rollup";
   const rollup = insertJob(rollupScope);
-  // Emit a job event for each freshly queued session task so the UI's live
-  // Jobs page populates immediately. We can't easily collect their ids inside
-  // the transaction, so re-query for any queued session jobs and broadcast.
-  const queued = db
+  // Tell the UI "many rows changed" with a single event instead of 1k+
+  // individual `job` events. Each per-row event triggered a setQueryData
+  // burst in the live bridge that froze the manager's browser during a
+  // full fan-out. The bulk event is debounced into one invalidate.
+  const queuedCount = (db
     .prepare(
-      `SELECT * FROM analyze_jobs
-        WHERE status = 'queued' AND scope LIKE 'session:%'
-        ORDER BY started_at ASC`,
+      `SELECT COUNT(*) AS n FROM analyze_jobs
+        WHERE status = 'queued' AND scope LIKE 'session:%'`,
     )
-    .all() as any[];
-  for (const r of queued) {
-    publishEvent({ type: "job", job: rowToJob(r) });
-  }
+    .get() as { n: number }).n;
+  publishEvent({ type: "jobs_bulk_changed", count: queuedCount });
 
   kickWorkers();
   return rollup;
+}
+
+// Auto-enqueue from the gateway capture path. Inserts a queued
+// `session:<sid>` row if there isn't already an active (queued or running)
+// one for that scope. Whether workers are kicked depends on the persisted
+// `auto_drain` toggle: ON (default) means the session is analyzed in the
+// background as soon as it's captured; OFF leaves it sitting in `queued`
+// until the manager flips the toggle (or runs "Re-analyze all").
+export function enqueueSessionForCapture(sessionId: string): Job | null {
+  const scope = `session:${sessionId}`;
+  const active = selectActiveByScopeStmt.get(scope) as any;
+  if (active) return rowToJob(active);
+  const job = insertJob(scope);
+  if (getAutoDrain()) kickWorkers();
+  return job;
+}
+
+// Public "run the queue" trigger. Idempotent — if workers are already
+// draining, this is a no-op. Returns counts so the UI can react with a
+// toast or progress chip.
+export function runQueue(): { picked: number; remaining: number } {
+  const before = (db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM analyze_jobs
+        WHERE status IN ('queued', 'running')`,
+    )
+    .get() as { n: number }).n;
+  kickWorkers();
+  const remaining = (db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM analyze_jobs
+        WHERE status IN ('queued', 'running')`,
+    )
+    .get() as { n: number }).n;
+  return { picked: before, remaining };
 }
 
 function buildOptions(): AnalyzeOptions {
@@ -346,8 +388,16 @@ let rollupRunning = false;
 let pendingKicks = 0;
 
 function kickWorkers(): void {
-  // Spin up additional session workers up to the cap.
-  while (activeSessionWorkers < MAX_WORKERS) {
+  // Only spawn workers up to the number of actually-queued tasks. Spinning
+  // up MAX_WORKERS unconditionally creates a race: when the queue is empty
+  // (e.g. resumeQueuedJobs on boot before the fan-out commits), each worker
+  // increments activeSessionWorkers synchronously, claims null, and returns
+  // — but the .finally decrements fire as microtasks, so for one tick the
+  // counter is pinned at MAX_WORKERS. The very next sync caller (the boot
+  // fan-out) hits this `while` and no-ops, then nothing kicks again.
+  const queued = (countQueuedSessionsOnlyStmt.get() as { n: number }).n;
+  const target = Math.min(MAX_WORKERS, queued);
+  while (activeSessionWorkers < target) {
     activeSessionWorkers++;
     void sessionWorkerLoop().finally(() => {
       activeSessionWorkers--;
@@ -584,9 +634,11 @@ export function deleteJob(id: string): { ok: true } | { ok: false; reason: strin
 }
 
 // Used by index.ts boot path: resume any queued tasks left over from a
-// previous restart.
+// previous restart. Respects the persisted auto_drain toggle so a manager
+// who turned it off doesn't get a surprise burst of analyzes on the next
+// container boot.
 export function resumeQueuedJobs(): void {
-  kickWorkers();
+  if (getAutoDrain()) kickWorkers();
 }
 
 // Surface stats for the Jobs page header at-a-glance.
@@ -609,3 +661,15 @@ export function jobCounts(): {
 
 // Reference unused vars defensively so stricter linters don't complain.
 void pendingKicks;
+
+// Wire the gateway → analyze-queue auto-enqueue. Each captured request
+// idempotently queues a session task (no worker kick — workers only spin
+// up when the manager presses "Run queue" or "Re-analyze all"). See db.ts
+// `setOnRequestRecorded` for the dependency-direction reasoning.
+setOnRequestRecorded((sessionId) => {
+  try {
+    enqueueSessionForCapture(sessionId);
+  } catch {
+    // Never let queue failures bubble back into the gateway.
+  }
+});

@@ -1,13 +1,20 @@
 import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { EmptyState } from "../components/EmptyState";
 import { MetricChips } from "../components/MetricChips";
 import { Drawer } from "../components/insights/Drawer";
 import { fmt } from "../format";
 import { formatUsd, titleCase, truncate } from "../insights/format";
+import { api } from "../api";
 import {
   flattenUsers,
+  qk,
   userInsightsQuery,
   usersAggQuery,
   usersListQuery,
@@ -58,6 +65,23 @@ export function UsersPage() {
     p.delete("user");
     setParams(p, { replace: false });
   };
+
+  // Destructive: deletes the user's sessions, requests, insights row, extract
+  // cache, queued analyze jobs. Confirm before firing because there's no
+  // undo. Invalidate broadly — user totals show up on other pages too.
+  const qc = useQueryClient();
+  const deleteUserMut = useMutation({
+    mutationFn: (id: string) => api.deleteUser(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.users.root });
+      qc.invalidateQueries({ queryKey: qk.sessions.root });
+      qc.invalidateQueries({ queryKey: qk.requests.root });
+      qc.invalidateQueries({ queryKey: qk.insights.root });
+      qc.invalidateQueries({ queryKey: qk.jobs.root });
+      qc.invalidateQueries({ queryKey: qk.stats });
+    },
+    onError: (e) => alert(`Failed to delete user: ${String(e)}`),
+  });
 
   // wizard = top user by requests with low error rate
   const wizardId = useMemo(() => {
@@ -160,6 +184,7 @@ export function UsersPage() {
                 <th className="text-right">Avg latency</th>
                 <th className="text-right">Errors</th>
                 <th>Last seen</th>
+                <th className="text-right">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -196,11 +221,42 @@ export function UsersPage() {
                     </span>
                   </td>
                   <td className="opacity-80">{fmt.rel(u.last_seen)}</td>
+                  <td
+                    className="text-right"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      className="nb-chip"
+                      disabled={
+                        deleteUserMut.isPending &&
+                        deleteUserMut.variables === u.user_id
+                      }
+                      onClick={() => {
+                        if (
+                          confirm(
+                            `Delete user "${u.user_id}" and all ${u.session_count} of their sessions? This cannot be undone.`,
+                          )
+                        ) {
+                          deleteUserMut.mutate(u.user_id);
+                        }
+                      }}
+                      title="Delete this user and all their data"
+                      style={{ cursor: "pointer" }}
+                      aria-label="delete"
+                    >
+                      <TrashIcon />
+                      {deleteUserMut.isPending &&
+                      deleteUserMut.variables === u.user_id
+                        ? "…"
+                        : "delete"}
+                    </button>
+                  </td>
                 </tr>
               ))}
               {!done && rows.length > 0 && (
                 <tr>
-                  <td colSpan={8} className="table-loadmore">
+                  <td colSpan={9} className="table-loadmore">
                     <div ref={sentinelRef} className="infinite-sentinel" />
                     {loading ? "loading more…" : `${rows.length} of ${total} loaded`}
                   </td>
@@ -360,4 +416,24 @@ function outcomeColor(o: string): string {
     default:
       return "var(--color-mist)";
   }
+}
+
+function TrashIcon() {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width="11"
+      height="11"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      aria-hidden
+    >
+      <path
+        d="M3 4h10M6.5 4V2.5h3V4M5 4v9.5a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1V4M7 7v5M9 7v5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
 }

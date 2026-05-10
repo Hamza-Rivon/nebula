@@ -763,10 +763,16 @@ api.get("/users", (c) => {
   const q = c.req.query("q")?.trim();
   const friction = c.req.query("friction")?.trim();
 
+  // The user key set is the union of the users registry (every user_id we
+  // ever saw on a request header, even ones whose request errored at
+  // validation) and the distinct user_ids that actually made it into
+  // `requests`. UNION dedupes, including the NULL anonymous bucket. This
+  // is what makes a user appear in the tab even before their first
+  // successful capture.
   const where: string[] = [];
   const params: any[] = [];
   if (q) {
-    where.push("user_id LIKE ? ESCAPE '\\'");
+    where.push("uk.user_id LIKE ? ESCAPE '\\'");
     params.push(`%${q.replace(/[%_]/g, "\\$&")}%`);
   }
   if (friction) {
@@ -775,35 +781,51 @@ api.get("/users", (c) => {
       return c.json({ users: [], total: 0 });
     }
     const placeholders = Array.from(ids, () => "?").join(",");
-    where.push(`user_id IN (${placeholders})`);
+    where.push(`uk.user_id IN (${placeholders})`);
     params.push(...ids);
   }
   const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
   const rows = db
     .prepare(
-      `SELECT
-         COALESCE(user_id, '(anonymous)') AS user_id,
-         COUNT(*) AS request_count,
-         COUNT(DISTINCT session_id) AS session_count,
-         COALESCE(SUM(cost),0) AS cost,
-         COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) AS tokens,
-         COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
-         COALESCE(SUM(cache_creation_tokens),0) AS cache_creation_tokens,
-         COALESCE(AVG(latency_ms),0) AS avg_latency_ms,
-         SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors,
-         MAX(started_at) AS last_seen
-       FROM requests
+      `WITH user_keys AS (
+         SELECT user_id FROM users
+         UNION
+         SELECT DISTINCT user_id FROM requests
+       )
+       SELECT
+         COALESCE(uk.user_id, '(anonymous)') AS user_id,
+         COUNT(r.id) AS request_count,
+         COUNT(DISTINCT r.session_id) AS session_count,
+         COALESCE(SUM(r.cost), 0) AS cost,
+         COALESCE(SUM(COALESCE(r.input_tokens,0)+COALESCE(r.output_tokens,0)), 0) AS tokens,
+         COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
+         COALESCE(SUM(r.cache_creation_tokens), 0) AS cache_creation_tokens,
+         COALESCE(AVG(r.latency_ms), 0) AS avg_latency_ms,
+         SUM(CASE WHEN r.status='error' THEN 1 ELSE 0 END) AS errors,
+         -- For a user with zero captured requests, MAX(started_at) is NULL;
+         -- fall back to the registry's last_seen so the column isn't blank.
+         COALESCE(MAX(r.started_at),
+                  (SELECT last_seen FROM users u2 WHERE u2.user_id = uk.user_id)) AS last_seen
+       FROM user_keys uk
+       LEFT JOIN requests r ON
+         (uk.user_id IS NULL AND r.user_id IS NULL) OR (uk.user_id = r.user_id)
        ${w}
-       GROUP BY user_id
-       ORDER BY request_count DESC
+       GROUP BY uk.user_id
+       ORDER BY request_count DESC, last_seen DESC
        LIMIT ? OFFSET ?`,
     )
     .all(...params, limit, offset);
-  // total = number of distinct user buckets matching the WHERE
   const total = (
     db
-      .prepare(`SELECT COUNT(DISTINCT user_id) AS n FROM requests ${w}`)
+      .prepare(
+        `WITH user_keys AS (
+           SELECT user_id FROM users
+           UNION
+           SELECT DISTINCT user_id FROM requests
+         )
+         SELECT COUNT(*) AS n FROM user_keys uk ${w}`,
+      )
       .get(...params) as any
   ).n;
   return c.json({ users: rows, total });
@@ -1031,5 +1053,124 @@ function emitMessageBlocks(args: EmitArgs): void {
     }
   }
 }
+
+// =============================================================================
+// Destructive operations: delete a session or a user (and everything tied to
+// them). Wiped in a single transaction so a partial state can never leak. The
+// blast radius is intentionally large — this is the manager confirming "this
+// data should not exist anymore", and that includes the analyze cache so a
+// later re-analyze doesn't resurrect ghost rows from the extract cache.
+// =============================================================================
+
+function deleteSessionCascade(sessionId: string): { ok: boolean } {
+  const exists =
+    (db.prepare(`SELECT 1 FROM sessions WHERE id = ?`).get(sessionId) as
+      | { 1: number }
+      | undefined) != null;
+  if (!exists) return { ok: false };
+  const tx = db.transaction(() => {
+    db.prepare(`DELETE FROM requests WHERE session_id = ?`).run(sessionId);
+    db.prepare(`DELETE FROM sessions WHERE id = ?`).run(sessionId);
+    // Insights side. Caches keyed by session_id share the same cleanup so a
+    // re-analyze starts from a clean slate for this id.
+    db.prepare(`DELETE FROM insights_sessions WHERE session_id = ?`).run(
+      sessionId,
+    );
+    db.prepare(`DELETE FROM insights_transcripts WHERE session_id = ?`).run(
+      sessionId,
+    );
+    db.prepare(`DELETE FROM insights_extracts WHERE session_id = ?`).run(
+      sessionId,
+    );
+    // Drop any analyze_job rows scoped to this session (queued/running ones
+    // become orphaned otherwise; the row's `session_id` lives in the scope
+    // string `session:<id>` with optional `+force` suffix).
+    db.prepare(
+      `DELETE FROM analyze_jobs WHERE scope = ? OR scope = ?`,
+    ).run(`session:${sessionId}`, `session:${sessionId}+force`);
+  });
+  tx();
+  return { ok: true };
+}
+
+api.delete("/sessions/:id", (c) => {
+  const id = c.req.param("id");
+  const result = deleteSessionCascade(id);
+  if (!result.ok) return c.json({ error: "not_found" }, 404);
+  return c.json({ ok: true });
+});
+
+api.delete("/users/:id", (c) => {
+  // The Users list shows raw user_id, with NULL coalesced to the literal
+  // "(anonymous)". Match the same way on delete so the frontend can pass
+  // back exactly what it displayed without learning about NULLs.
+  const id = c.req.param("id");
+  // Find every session this user owned. Use COALESCE for the NULL case.
+  const sessionRows = db
+    .prepare(
+      `SELECT id FROM sessions WHERE COALESCE(user_id, '(anonymous)') = ?`,
+    )
+    .all(id) as { id: string }[];
+  const sessionIds = sessionRows.map((r) => r.id);
+  // Also pick up sessions that don't have a user_id on the row but whose
+  // requests do — keeps the cascade total even if user_id was set later.
+  const fromRequests = db
+    .prepare(
+      `SELECT DISTINCT session_id FROM requests
+        WHERE COALESCE(user_id, '(anonymous)') = ?`,
+    )
+    .all(id) as { session_id: string }[];
+  for (const r of fromRequests) {
+    if (!sessionIds.includes(r.session_id)) sessionIds.push(r.session_id);
+  }
+  if (sessionIds.length === 0) {
+    // No sessions yet, but the user may still be registered (header arrived
+    // but every request errored at validation, or all their sessions were
+    // already cleaned up). Wipe the registry row + any stale insights_users
+    // row so the manager UI stops showing them. NULL is intentionally not
+    // in the users registry, so anonymous can only land here via insights.
+    const reg = db
+      .prepare(`DELETE FROM users WHERE user_id = ?`)
+      .run(id) as { changes: number };
+    const insightsId =
+      (db
+        .prepare(
+          `SELECT id FROM insights_users
+            WHERE COALESCE(raw_user_id, '(anonymous)') = ?`,
+        )
+        .get(id) as { id: string } | undefined)?.id ?? null;
+    if (insightsId) {
+      db.prepare(`DELETE FROM insights_users WHERE id = ?`).run(insightsId);
+    }
+    if (reg.changes === 0 && !insightsId) {
+      return c.json({ error: "not_found" }, 404);
+    }
+    return c.json({ ok: true, sessionsDeleted: 0 });
+  }
+  const tx = db.transaction(() => {
+    for (const sid of sessionIds) {
+      db.prepare(`DELETE FROM requests WHERE session_id = ?`).run(sid);
+      db.prepare(`DELETE FROM sessions WHERE id = ?`).run(sid);
+      db.prepare(`DELETE FROM insights_sessions WHERE session_id = ?`).run(sid);
+      db.prepare(`DELETE FROM insights_transcripts WHERE session_id = ?`).run(
+        sid,
+      );
+      db.prepare(`DELETE FROM insights_extracts WHERE session_id = ?`).run(sid);
+      db.prepare(
+        `DELETE FROM analyze_jobs WHERE scope = ? OR scope = ?`,
+      ).run(`session:${sid}`, `session:${sid}+force`);
+    }
+    // Drop the users registry row + insights_users (clusters keep a
+    // `members` array of session ids; rebuilding clusters is the rollup's
+    // job, not ours).
+    db.prepare(`DELETE FROM users WHERE user_id = ?`).run(id);
+    db.prepare(
+      `DELETE FROM insights_users
+        WHERE COALESCE(raw_user_id, '(anonymous)') = ?`,
+    ).run(id);
+  });
+  tx();
+  return c.json({ ok: true, sessionsDeleted: sessionIds.length });
+});
 
 api.route("/", insightsApi);

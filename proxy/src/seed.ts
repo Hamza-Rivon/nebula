@@ -43,6 +43,15 @@ const upsertImportStmt = db.prepare(
      session_count = excluded.session_count,
      request_count = excluded.request_count`,
 );
+const deleteLinksForFileStmt = db.prepare(
+  `DELETE FROM seed_session_links WHERE file_path = ?`,
+);
+const insertLinkStmt = db.prepare(
+  `INSERT OR IGNORE INTO seed_session_links (file_path, session_id) VALUES (?, ?)`,
+);
+const countLinksForFileStmt = db.prepare(
+  `SELECT COUNT(*) AS n FROM seed_session_links WHERE file_path = ?`,
+);
 const deleteSessionStmt = db.prepare(`DELETE FROM sessions WHERE id = ?`);
 const insertSessionStmt = db.prepare(
   `INSERT INTO sessions (id, user_id, created_at, updated_at, request_count,
@@ -121,9 +130,17 @@ export async function seedFromDir(dir: string): Promise<SeedSummary> {
       // last time, so the file content is unchanged. We avoid reading a single
       // byte. This collapses the warm-restart cost from O(total file bytes) to
       // O(stat per file) — the dominant win on `restart: unless-stopped`.
+      // BUT: only skip if at least one of the previously-imported sessions
+      // still exists. The link table cascade-deletes when a session is wiped,
+      // so a missing link means the cache is stale and we must re-import.
       if (prev && prev.mtime === mtime && prev.size === size) {
-        summary.skipped++;
-        continue;
+        const links = (countLinksForFileStmt.get(file) as { n: number }).n;
+        if (links > 0) {
+          summary.skipped++;
+          continue;
+        }
+        // Fall through to the slow path: links were dropped (session deleted
+        // or pre-link migration), so re-import this file.
       }
 
       // Slow path: stream the file, hashing and parsing in one pass. We never
@@ -165,21 +182,26 @@ export async function seedFromDir(dir: string): Promise<SeedSummary> {
 
       // Content-hash fallback: mtime/size differed (touched, copied, etc.) but
       // bytes are identical. Refresh the cache row so next boot takes the
-      // fast-path, and skip the projection.
+      // fast-path, and skip the projection — but only if the link rows for
+      // this file are still intact. If sessions were deleted underneath us,
+      // we have to re-import even though the bytes are unchanged.
       if (prev && prev.sha256 === sha) {
-        upsertImportStmt.run(
-          np({
-            file_path: file,
-            sha256: sha,
-            mtime,
-            size,
-            imported_at: prev.imported_at,
-            session_count: 0,
-            request_count: 0,
-          }),
-        );
-        summary.skipped++;
-        continue;
+        const links = (countLinksForFileStmt.get(file) as { n: number }).n;
+        if (links > 0) {
+          upsertImportStmt.run(
+            np({
+              file_path: file,
+              sha256: sha,
+              mtime,
+              size,
+              imported_at: prev.imported_at,
+              session_count: 0,
+              request_count: 0,
+            }),
+          );
+          summary.skipped++;
+          continue;
+        }
       }
 
       const projection = projectLines(file, root, lines);
@@ -199,6 +221,14 @@ export async function seedFromDir(dir: string): Promise<SeedSummary> {
         }
         for (const r of projRequests) {
           insertRequestStmt.run(np(r));
+        }
+        // Refresh link rows for this file so the cascade-delete path can
+        // invalidate the cache later. Drop any previous links first since
+        // a re-import may have produced a different session_id (e.g. if the
+        // file was renamed or the agent-id collapsing rules changed).
+        deleteLinksForFileStmt.run(file);
+        for (const sess of projSessions) {
+          insertLinkStmt.run(file, sess.id);
         }
         upsertImportStmt.run(
           np({
@@ -496,9 +526,48 @@ function projectLines(
 }
 
 // Pool of synthetic engineers the seeded transcripts get distributed across.
-// Order matters — adding a new entry shifts every project's bucket assignment,
-// so the analyzer reseeds different personas after the change. Keep stable.
-const SYNTHETIC_ENGINEERS = ["alex", "priya", "marcus", "sara"] as const;
+// Configure via NEBULA_ENGINEERS env var instead of editing code.
+// Format: name[:weight],name[:weight],...  (weights optional, default equal)
+// Example: NEBULA_ENGINEERS=leo:0.17,maria:0.17,jordan:0.66
+
+type Engineer = { name: string; weight: number };
+
+function parseEngineers(): Engineer[] {
+  const env = process.env.NEBULA_ENGINEERS;
+  if (!env) {
+    return [
+      { name: "alex", weight: 0.25 },
+      { name: "priya", weight: 0.25 },
+      { name: "marcus", weight: 0.25 },
+      { name: "sara", weight: 0.25 },
+    ];
+  }
+
+  const parts = env.split(",").map((p) => p.trim()).filter(Boolean);
+  const engineers: Engineer[] = [];
+
+  for (const part of parts) {
+    const colonIdx = part.lastIndexOf(":");
+    if (colonIdx === -1) {
+      engineers.push({ name: part, weight: 1 });
+    } else {
+      const name = part.slice(0, colonIdx).trim();
+      const weight = Number(part.slice(colonIdx + 1).trim());
+      if (!name || !Number.isFinite(weight) || weight < 0) {
+        throw new Error(`Invalid NEBULA_ENGINEERS entry: "${part}"`);
+      }
+      engineers.push({ name, weight });
+    }
+  }
+
+  const total = engineers.reduce((s, e) => s + e.weight, 0);
+  if (total <= 0) {
+    throw new Error("NEBULA_ENGINEERS weights must sum to > 0");
+  }
+  return engineers.map((e) => ({ ...e, weight: e.weight / total }));
+}
+
+const ENGINEERS = parseEngineers();
 
 function projectKey(file: string, root: string): string {
   // Top-level directory under the seed root, e.g.
@@ -513,8 +582,13 @@ function projectKey(file: string, root: string): string {
 
 function syntheticEngineerFor(projectKey: string): string {
   const h = createHash("sha256").update(projectKey).digest();
-  const idx = h.readUInt32BE(0) % SYNTHETIC_ENGINEERS.length;
-  return SYNTHETIC_ENGINEERS[idx]!;
+  const n = h.readUInt32BE(0) / 0xffffffff;
+  let cum = 0;
+  for (const e of ENGINEERS) {
+    cum += e.weight;
+    if (n < cum) return e.name;
+  }
+  return ENGINEERS[ENGINEERS.length - 1].name;
 }
 
 function parseTs(iso?: string): number | null {

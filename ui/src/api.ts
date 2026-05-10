@@ -274,4 +274,19 @@ export const api = {
   insightsSessionsByFilter: (
     q: { friction?: string; user?: string; limit?: number; offset?: number },
   ) => fetch(`/api/insights/sessions${qs(q)}`).then(j<InsightsSessionsResp>),
+
+  // Destructive: delete a session and everything tied to it (requests,
+  // insights row, transcript, extract cache, queued/done jobs). Same blast
+  // radius as the manual cleanup the proxy does on `clearInsights`, but
+  // scoped to one session id.
+  deleteSession: (id: string) =>
+    fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }).then(
+      j<{ ok: true }>,
+    ),
+  // Destructive: delete every session this user owned + the user row itself.
+  // The display id "(anonymous)" maps server-side to NULL user_id rows.
+  deleteUser: (id: string) =>
+    fetch(`/api/users/${encodeURIComponent(id)}`, { method: "DELETE" }).then(
+      j<{ ok: true; sessionsDeleted: number }>,
+    ),
 };

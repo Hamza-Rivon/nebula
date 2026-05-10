@@ -28,7 +28,7 @@ export function TeamDrawer({ team, data }: Props) {
         <Stat label="Sessions" value={String(team.sessionCount)} />
         <Stat label="Spend" value={formatUsd(team.totalCostUsd, { decimals: 0 })} />
         <Stat
-          label="Waste"
+          label="Exposure"
           value={formatUsd(team.totalWasteUsd, { decimals: 0 })}
           tone={team.totalWasteUsd > 0 ? "warn" : undefined}
         />

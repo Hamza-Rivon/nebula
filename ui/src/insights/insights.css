@@ -211,8 +211,8 @@
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
 }
-.pulse-value.warm { color: #B23A1F; }
-.pulse-value.good { color: #1F7A3A; }
+.pulse-value.warm { color: #4A1208; }
+.pulse-value.good { color: #0D3D1F; }
 .pulse-sub {
   font-size: 0.78rem;
   opacity: 0.7;

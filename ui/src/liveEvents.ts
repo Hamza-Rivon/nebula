@@ -35,6 +35,14 @@ export type LiveJob = {
 
 export type LiveJobEvent = { type: "job"; job: LiveJob };
 export type LiveJobDeletedEvent = { type: "job_deleted"; id: string };
+// Backend emits this once when a fan-out adds many job rows in one shot
+// (e.g. "Re-analyze all" inserts 1k+ session tasks). The bridge translates
+// it into a single throttled invalidate, which avoids the per-row event
+// storm that used to hang the browser during a manual fan-out.
+export type LiveJobsBulkChangedEvent = {
+  type: "jobs_bulk_changed";
+  count: number;
+};
 // The proxy emits these as session-level analyze tasks complete and as the
 // cross-corpus rollup finishes. The bridge uses them to patch the Insights
 // dataset cache progressively, so users watch sessions land instead of
@@ -51,6 +59,7 @@ export type LiveEvent =
   | LiveRequestEvent
   | LiveJobEvent
   | LiveJobDeletedEvent
+  | LiveJobsBulkChangedEvent
   | LiveSessionAnalyzedEvent
   | LiveAggregatesUpdatedEvent
   | { type: "ping" };

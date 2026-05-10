@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { insightsApi } from "../insights/api";
 import type { Job } from "../insights/types";
 import { prefetchTab, type TabPath } from "../prefetch";
@@ -58,16 +58,11 @@ export function Layout() {
     }
   }, [job?.status, qc]);
 
-  const startAnalyze = useMutation({
-    mutationFn: () => insightsApi.postAnalyze({ all: true }),
-    onSuccess: (j) => setJobId(j.id),
-    onError: (e) => alert(`Failed to start analyze: ${String(e)}`),
-  });
-
-  const onAnalyze = () => {
-    if (analyzing || startAnalyze.isPending) return;
-    startAnalyze.mutate();
-  };
+  // Sidebar no longer triggers analysis directly. The auto-drain toggle on
+  // the Jobs page is the single control: when ON, every captured live
+  // request auto-enqueues AND auto-runs in the background; when OFF, the
+  // queue grows passively. The sidebar still surfaces the active job's
+  // progress chip below.
 
   const manager = NAV.filter((n) => n.section === "manager");
   const engineer = NAV.filter((n) => n.section === "engineer");
@@ -81,7 +76,6 @@ export function Layout() {
             <div className="font-display text-lg font-bold tracking-tight">
               Nebula
             </div>
-            <div className="text-[11px] opacity-60">session intel</div>
           </div>
         </div>
 
@@ -132,15 +126,6 @@ export function Layout() {
             />
           </form>
 
-          <button
-            className="nb-btn"
-            disabled={analyzing || startAnalyze.isPending}
-            onClick={onAnalyze}
-            style={{ width: "100%", justifyContent: "center" }}
-          >
-            {analyzing || startAnalyze.isPending ? "Analyzing…" : "Re-analyze"}
-          </button>
-
           {job && (
             <div className="nb-card-flat px-2 py-1.5 text-xs">
               <div className="flex items-center gap-2">
@@ -180,8 +165,13 @@ export function Layout() {
           )}
 
           <span
-            className="nb-chip self-start"
-            style={{ background: "var(--color-mint)", fontSize: ".68rem" }}
+            className="nb-chip"
+            style={{
+              background: "var(--color-mint)",
+              fontSize: ".68rem",
+              width: "100%",
+              justifyContent: "center",
+            }}
           >
             <span className="inline-block h-2 w-2 rounded-full bg-[var(--color-ok)] nb-pulse" />
             proxy live

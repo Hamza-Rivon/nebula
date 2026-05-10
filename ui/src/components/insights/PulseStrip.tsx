@@ -1,5 +1,7 @@
+import { useMemo } from "react";
 import type { Dataset } from "../../insights/types";
 import { formatUsd } from "../../insights/format";
+import { firmRiskExposure } from "../../insights/risk";
 
 export function PulseStrip({
   data,
@@ -12,10 +14,11 @@ export function PulseStrip({
   const adoptionPct = Math.round(a.adoptionPct * 100);
   const teamCount = new Set(data.users.map((u) => u.team)).size;
   const winPct = Math.round(a.firmWinRate * 100);
-  const wastePct =
-    a.totalCostUsd > 0
-      ? Math.round((a.totalWasteUsd / a.totalCostUsd) * 100)
-      : 0;
+  // Forensics framing: the headline is "spend at risk" — the share of
+  // dollars sitting in sessions our pipeline would flag for a manager to
+  // glance at. Replaces the previous "% wasted" tile, which read as
+  // accounting truth despite being derived from LLM heuristics.
+  const risk = useMemo(() => firmRiskExposure(data.sessions), [data.sessions]);
   const delta =
     a.prevPeriodCostUsd != null ? a.totalCostUsd - a.prevPeriodCostUsd : null;
   const landed = data.sessions.filter(
@@ -50,10 +53,10 @@ export function PulseStrip({
         }
       />
       <PulseTile
-        label="Waste"
-        value={`${wastePct}%`}
-        sub={`${formatUsd(a.totalWasteUsd, { decimals: 0 })} of spend`}
-        accent="warm"
+        label="Spend at risk"
+        value={`${risk.pct}%`}
+        sub={`${formatUsd(risk.spendAtRisk, { decimals: 0 })} across ${risk.flaggedSessions} flagged session${risk.flaggedSessions === 1 ? "" : "s"}`}
+        accent={risk.pct >= 25 ? "warm" : risk.pct >= 10 ? undefined : "good"}
       />
     </div>
   );

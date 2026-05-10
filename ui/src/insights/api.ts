@@ -56,4 +56,11 @@ export const insightsApi = {
       j<{ ok: true }>,
     ),
   clear: () => fetch("/api/insights", { method: "DELETE" }).then(j<{ ok: true }>),
+  getSettings: () => fetch("/api/settings").then(j<{ autoDrain: boolean }>),
+  setAutoDrain: (autoDrain: boolean) =>
+    fetch("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ autoDrain }),
+    }).then(j<{ autoDrain: boolean }>),
 };
