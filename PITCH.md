@@ -79,35 +79,55 @@ top.
 
 ## Feedback
 
-- out of 3 options, option 2 is best  
+- out of 3 options, option 2 is best
 
 ## Questions
 
-what about if user prompt injects?  
-- Prompt injects will become less and less effective.  
-- Measures can be taken against that with a detection system  
+what about if user prompt injects?
 
-why would the company not built this themselves?  
-- It is constant evolution, so they would have to spend way more to have a single solution than if they used our solution, for which we work full-time.  
+- Prompt injects will become less and less effective.
+- Measures can be taken against that with a detection system
 
-what if the models are hosted locally?  
-- It still works because we use a proxy, so we only have to run the monitoring app on the server hosting the model.  
+why would the company not built this themselves?
 
-what about the privacy of the company data?  
-- It is all hosted on-premises with a simple docker image. No data goes out.  
+- It is constant evolution, so they would have to spend way more to have a
+  single solution than if they used our solution, for which we work full-time.
 
-how do you measure hard vs simple tasks and how does this correlate to costs  
-- Right now for the demo, it is a mix of large language and embedding models treating the conversations and attributing them scores, but the idea is to have our own models to treat it.  
+what if the models are hosted locally?
 
-does it work with codex?  
-- It is against their regulations, but all big providers will switch soon, or else people will adapt and change their ai provider.  
+- It still works because we use a proxy, so we only have to run the monitoring
+  app on the server hosting the model.
 
-what about employees that will refuse monitoring?  
-- Currently, most of the entreprise solutions already have monitoring implemented by default, and they have to accept it, so we believe that it won't be too much of a problem.  
+what about the privacy of the company data?
 
-why you and not the competition?  
-- Most competitors analyze AI systems. We analyze human systems using AI systems. Their product is destined for security or technical officers and engineers. Ours is destined for managers.  
-- Our real competitor is Oximy, which does the same thing as we do, but they detect failures, wastes and dangerous conversations while we use this information to help managers decide who needs more training and how to optimize costs.  
+- It is all hosted on-premises with a simple docker image. No data goes out.
+
+how do you measure hard vs simple tasks and how does this correlate to costs
+
+- Right now for the demo, it is a mix of large language and embedding models
+  treating the conversations and attributing them scores, but the idea is to
+  have our own models to treat it.
+
+does it work with codex?
+
+- It is against their regulations, but all big providers will switch soon, or
+  else people will adapt and change their ai provider.
+
+what about employees that will refuse monitoring?
+
+- Currently, most of the entreprise solutions already have monitoring
+  implemented by default, and they have to accept it, so we believe that it
+  won't be too much of a problem.
+
+why you and not the competition?
+
+- Most competitors analyze AI systems. We analyze human systems using AI
+  systems. Their product is destined for security or technical officers and
+  engineers. Ours is destined for managers.
+- Our real competitor is Oximy, which does the same thing as we do, but they
+  detect failures, wastes and dangerous conversations while we use this
+  information to help managers decide who needs more training and how to
+  optimize costs.
 
 ### TODO
 
@@ -119,30 +139,38 @@ why you and not the competition?
 
 ## Future
 
-- Session satisfaction  
-- Track recursive loops  
-- Use a lot of metrics collected automatically on ai conversations and create models with it in order to better predict failures and problems with ai usage  
-
+- Session satisfaction
+- Track recursive loops
+- Use a lot of metrics collected automatically on ai conversations and create
+  models with it in order to better predict failures and problems with ai usage
 
 ## Pitch
+
 ### Opening
-Our CTO spent 3'000$ on credits this month. 20% of it was wasted.  
+
+Our CTO spent 3'000$ on credits this month. 20% of it was wasted.
 
 ### Problem
-Agents are becoming more and more used in tech companies; managers and CTOs still do not know whether they are improving efficiency or just burning tokens.  
+
+Agents are becoming more and more used in tech companies; managers and CTOs
+still do not know whether they are improving efficiency or just burning tokens.
 
 High adoption does not mean efficiency.  
-Efficiency depends on how the ai is used.  
+Efficiency depends on how the ai is used.
 
 ### Solution
-Hello, my name is Tristan and I'm here today with my co-founders Leonard and Hamza. 
-We built Nebula, a B2B solution that analyzes the interactions employees have with ai.  
+
+Hello, my name is Tristan and I'm here today with my co-founders Leonard and
+Hamza. We built Nebula, a B2B solution that analyzes the interactions employees
+have with ai.  
 Hamza will show you how managers take action.
 
 ### Demo
-The app works with a proxy listing all llm conversations  
 
-Then the conversations are analyzed by our models and insights are extracted.  
+The app works with a proxy listing all llm conversations
+
+Then the conversations are analyzed by our models and insights are extracted.
 
 ### Conclusion
-Adoption was easy; we build what comes next.  
+
+Adoption was easy; we build what comes next.
