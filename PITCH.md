@@ -79,15 +79,35 @@ top.
 
 ## Feedback
 
-- out of 3 options, option 2 is best
+- out of 3 options, option 2 is best  
 
 ## Questions
 
-- what about if user prompt injects?
-- why would the company not built this themselves?
-- what about if the models are hosted locally?
-- what about the privacy of the company data?
-- how do you measure hard vs simple tasks and how does this correlate to costs
+what about if user prompt injects?  
+- Prompt injects will become less and less effective.  
+- Measures can be taken against that with a detection system  
+
+why would the company not built this themselves?  
+- It is constant evolution, so they would have to spend way more to have a single solution than if they used our solution, for which we work full-time.  
+
+what if the models are hosted locally?  
+- It still works because we use a proxy, so we only have to run the monitoring app on the server hosting the model.  
+
+what about the privacy of the company data?  
+- It is all hosted on-premises with a simple docker image. No data goes out.  
+
+how do you measure hard vs simple tasks and how does this correlate to costs  
+- Right now for the demo, it is a mix of large language and embedding models treating the conversations and attributing them scores, but the idea is to have our own models to treat it.  
+
+does it work with codex?  
+- It is against their regulations, but all big providers will switch soon, or else people will adapt and change their ai provider.  
+
+what about employees that will refuse monitoring?  
+- Currently, most of the entreprise solutions already have monitoring implemented by default, and they have to accept it, so we believe that it won't be too much of a problem.  
+
+why you and not the competition?  
+- Most competitors analyze AI systems. We analyze human systems using AI systems. Their product is destined for security or technical officers and engineers. Ours is destined for managers.  
+- Our real competitor is Oximy, which does the same thing as we do, but they detect failures, wastes and dangerous conversations while we use this information to help managers decide who needs more training and how to optimize costs.  
 
 ### TODO
 
@@ -99,4 +119,6 @@ top.
 
 ## Future
 
-- Session satisfaction
+- Session satisfaction  
+- Track recursive loops  
+- Use a lot of metrics collected automatically on ai conversations and create models with it in order to better predict failures and problems with ai usage  
