@@ -1,8 +1,16 @@
-import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
-import { api, type SessionRow } from "../api";
+import { useMemo, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { EmptyState } from "../components/EmptyState";
+import { MetricChips } from "../components/MetricChips";
 import { fmt } from "../format";
+import {
+  flattenSessions,
+  sessionsAggQuery,
+  sessionsListQuery,
+} from "../queries";
+import { useInfiniteScroll } from "../useInfiniteScroll";
+import { pickSessionId, useFreshIds } from "../liveBridge";
 
 const CURL_DEMO = `curl http://localhost:8080/v1/chat/completions \\
   -H "Content-Type: application/json" \\
@@ -11,59 +19,100 @@ const CURL_DEMO = `curl http://localhost:8080/v1/chat/completions \\
        "messages":[{"role":"user","content":"Hello, Nebula!"}]}'`;
 
 export function SessionsPage() {
-  const [rows, setRows] = useState<SessionRow[]>([]);
-  const [total, setTotal] = useState(0);
   const [q, setQ] = useState("");
-  const seen = useRef<Set<string>>(new Set());
-  const [newIds, setNewIds] = useState<Set<string>>(new Set());
+  const [user, setUser] = useState("");
 
-  useEffect(() => {
-    let alive = true;
-    const tick = () =>
-      api.sessions(100).then((r) => {
-        if (!alive) return;
-        if (seen.current.size > 0) {
-          const fresh = new Set<string>();
-          for (const s of r.sessions) {
-            if (!seen.current.has(s.id)) fresh.add(s.id);
-          }
-          if (fresh.size) {
-            setNewIds(fresh);
-            setTimeout(() => alive && setNewIds(new Set()), 700);
-          }
-        }
-        seen.current = new Set(r.sessions.map((x) => x.id));
-        setRows(r.sessions);
-        setTotal(r.total);
-      });
-    tick();
-    const t = setInterval(tick, 4000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, []);
-
-  const filtered = rows.filter((r) =>
-    !q ||
-    r.id.toLowerCase().includes(q.toLowerCase()) ||
-    (r.user_id ?? "").toLowerCase().includes(q.toLowerCase()),
+  const filters = useMemo(
+    () => ({
+      q: q.trim() || undefined,
+      user: user.trim() || undefined,
+    }),
+    [q, user],
   );
+
+  const { data: agg } = useQuery(sessionsAggQuery(filters));
+
+  const list = useInfiniteQuery(sessionsListQuery(filters));
+  const { rows, total } = flattenSessions(list.data?.pages);
+  const sentinelRef = useInfiniteScroll(
+    () => list.fetchNextPage(),
+    list.hasNextPage && !list.isFetchingNextPage,
+  );
+  const loading = list.isLoading || list.isFetchingNextPage;
+  const done = !list.hasNextPage;
+  const freshIds = useFreshIds(pickSessionId);
+
+  const navigate = useNavigate();
+  const goToSession = (id: string) =>
+    navigate(`/sessions/${encodeURIComponent(id)}`);
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-3">
+      <div className="flex flex-wrap items-baseline gap-3">
         <h2 className="font-display text-2xl font-bold">Sessions</h2>
         <span className="nb-chip" style={{ background: "var(--color-mint)" }}>
-          {total} total
+          {fmt.num(total)} matching
         </span>
+      </div>
+
+      <MetricChips
+        items={[
+          {
+            label: "Sessions",
+            value: fmt.num(agg?.count ?? 0),
+            bg: "var(--color-mist)",
+          },
+          {
+            label: "Total spend",
+            value: fmt.cost(agg?.total_cost ?? 0),
+            bg: "var(--color-lime)",
+          },
+          {
+            label: "Total tokens",
+            value: fmt.num(agg?.total_tokens ?? 0),
+            bg: "var(--color-sky)",
+          },
+          {
+            label: "Avg requests / session",
+            value: (agg?.avg_requests_per_session ?? 0).toFixed(1),
+            bg: "var(--color-butter)",
+          },
+          {
+            label: "Top model",
+            value: agg?.top_model ?? "—",
+            hint: agg?.top_model ? "across matched sessions" : null,
+            bg: "var(--color-lavender)",
+          },
+        ]}
+      />
+
+      <div className="filter-row">
         <input
-          className="nb-input ml-auto max-w-xs"
-          placeholder="filter by id or user…"
+          className="nb-input grow"
+          placeholder="filter by session id or user…"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
+        <input
+          className="nb-input"
+          placeholder="user id"
+          value={user}
+          onChange={(e) => setUser(e.target.value)}
+          style={{ maxWidth: "10rem" }}
+        />
+        {(q || user) && (
+          <button
+            className="nb-chip"
+            onClick={() => {
+              setQ("");
+              setUser("");
+            }}
+          >
+            clear
+          </button>
+        )}
       </div>
+
       <div className="nb-card overflow-hidden">
         <table className="nb-table">
           <thead>
@@ -77,14 +126,24 @@ export function SessionsPage() {
             </tr>
           </thead>
           <tbody>
-            {filtered.map((s) => (
-              <tr key={s.id} className={newIds.has(s.id) ? "nb-flash" : ""}>
+            {rows.map((s) => (
+              <tr
+                key={s.id}
+                onClick={() => goToSession(s.id)}
+                className={freshIds.has(s.id) ? "nb-flash" : undefined}
+              >
                 <td>
-                  <Link className="nb-tag" to={`/sessions/${encodeURIComponent(s.id)}`}>
+                  <Link
+                    className="nb-tag"
+                    to={`/sessions/${encodeURIComponent(s.id)}`}
+                    onClick={(e) => e.stopPropagation()}
+                  >
                     {s.id}
                   </Link>
                 </td>
-                <td className="opacity-80">{s.user_id ?? <span className="opacity-40">—</span>}</td>
+                <td className="opacity-80">
+                  {s.user_id ?? <span className="opacity-40">—</span>}
+                </td>
                 <td className="text-right tabular-nums">{fmt.num(s.request_count)}</td>
                 <td className="text-right tabular-nums">
                   {fmt.num(s.total_input_tokens + s.total_output_tokens)}
@@ -95,15 +154,23 @@ export function SessionsPage() {
                 </td>
               </tr>
             ))}
-            {!filtered.length && (
+            {!loading && !rows.length && (
               <tr>
                 <td colSpan={6}>
                   <EmptyState
-                    title="No sessions yet"
-                    hint="Send a request to /v1/chat/completions to bootstrap your first session."
+                    title="No sessions match"
+                    hint="Adjust the filters or send a fresh request to /v1/chat/completions."
                     curl={CURL_DEMO}
                     illustration="session"
                   />
+                </td>
+              </tr>
+            )}
+            {!done && rows.length > 0 && (
+              <tr>
+                <td colSpan={6} className="table-loadmore">
+                  <div ref={sentinelRef} className="infinite-sentinel" />
+                  {loading ? "loading more…" : `${rows.length} of ${total} loaded`}
                 </td>
               </tr>
             )}

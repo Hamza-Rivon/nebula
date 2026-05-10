@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, type JsonValue, type RequestDetail } from "../api";
+import { useQuery } from "@tanstack/react-query";
+import { type JsonValue, type RequestDetail } from "../api";
 import { ConversationView, extractEvents } from "../components/ConversationView";
 import { RequestTimeline } from "../components/RequestTimeline";
 import { fmt } from "../format";
+import { requestDetailQuery } from "../queries";
 
 // =============================================================================
 // Page
@@ -12,20 +14,11 @@ import { fmt } from "../format";
 export function RequestDetailPage() {
   const { id = "" } = useParams();
   const nav = useNavigate();
-  const [r, setR] = useState<RequestDetail | null>(null);
-  const [err, setErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
-  useEffect(() => {
-    let alive = true;
-    api
-      .request(id)
-      .then((d) => alive && setR(d))
-      .catch((e) => alive && setErr(String(e)));
-    return () => {
-      alive = false;
-    };
-  }, [id]);
+  const query = useQuery(requestDetailQuery(id));
+  const r = query.data ?? null;
+  const err = query.error ? String(query.error) : null;
 
   const curl = useMemo(() => (r ? buildCurl(r) : ""), [r]);
 

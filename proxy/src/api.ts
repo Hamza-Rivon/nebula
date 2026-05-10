@@ -1,17 +1,74 @@
 import { Hono } from "hono";
 import { db } from "./db.js";
-import { listConfiguredProviders, PROVIDERS } from "./providers.js";
-import { insightsApi } from "./insights/api.js";
+import { listProviders } from "./providers.js";
+import { catalogStatus } from "./catalog.js";
+import { subscribe as subscribeEvents, subscriberCount } from "./events.js";
+import {
+  insightsApi,
+} from "./insights/api.js";
+import {
+  getSession as getInsightsSession,
+  resolveInsightsUserId,
+  getUser as getInsightsUser,
+  listSessionsForUser,
+} from "./insights/db.js";
 
 export const api = new Hono();
 
 api.get("/providers", (c) => {
-  return c.json({
-    providers: listConfiguredProviders().map((p) => ({
-      id: p.id,
-      configured: p.configured,
-      base_url: PROVIDERS[p.id].baseUrl,
-    })),
+  return c.json({ providers: listProviders() });
+});
+
+api.get("/catalog", (c) => {
+  return c.json(catalogStatus());
+});
+
+// Server-Sent Events stream — UI clients open one EventSource and receive a
+// `data: <json>` line per captured request (plus periodic `:hb` heartbeats so
+// intermediaries don't time the connection out).
+api.get("/events", (c) => {
+  const enc = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let closed = false;
+      const write = (chunk: string) => {
+        if (closed) return;
+        try {
+          controller.enqueue(enc.encode(chunk));
+        } catch {
+          closed = true;
+        }
+      };
+      // Initial comment to flush headers and confirm the connection.
+      write(`:connected ${subscriberCount()}\n\n`);
+
+      const unsub = subscribeEvents(write);
+      const hb = setInterval(() => write(`:hb\n\n`), 25_000);
+
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        clearInterval(hb);
+        unsub();
+        try {
+          controller.close();
+        } catch {
+          // already closed
+        }
+      };
+      // The platform fetch() Request carries an AbortSignal that fires when
+      // the client disconnects; Hono exposes it via `c.req.raw.signal`.
+      c.req.raw.signal?.addEventListener("abort", cleanup);
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "connection": "keep-alive",
+      // Disable proxy buffering (nginx and similar) so events arrive promptly.
+      "x-accel-buffering": "no",
+    },
   });
 });
 
@@ -22,6 +79,8 @@ api.get("/stats", (c) => {
          COUNT(*) AS request_count,
          COALESCE(SUM(input_tokens),0) AS input_tokens,
          COALESCE(SUM(output_tokens),0) AS output_tokens,
+         COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
+         COALESCE(SUM(cache_creation_tokens),0) AS cache_creation_tokens,
          COALESCE(SUM(cost),0) AS cost,
          COALESCE(AVG(latency_ms),0) AS avg_latency_ms,
          SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count
@@ -31,9 +90,17 @@ api.get("/stats", (c) => {
   const sessions = db
     .prepare(`SELECT COUNT(*) AS session_count FROM sessions`)
     .get() as any;
+  // tokens = input + output only (cache reads excluded so the headline matches
+  // Claude Code's /status accounting). cache_tokens surfaces separately for
+  // cache-efficiency views.
   const byModel = db
     .prepare(
-      `SELECT model, COUNT(*) AS n, SUM(cost) AS cost, SUM(input_tokens+output_tokens) AS tokens
+      `SELECT model,
+              COUNT(*) AS n,
+              SUM(cost) AS cost,
+              SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)) AS tokens,
+              SUM(COALESCE(cache_read_tokens,0)) AS cache_read_tokens,
+              SUM(COALESCE(cache_creation_tokens,0)) AS cache_creation_tokens
        FROM requests GROUP BY model ORDER BY n DESC LIMIT 10`,
     )
     .all();
@@ -57,16 +124,87 @@ api.get("/stats", (c) => {
   return c.json({ ...totals, ...sessions, byModel, byProvider, recent });
 });
 
+// Build a WHERE fragment for the sessions list. `alias` is prepended to each
+// column name so the same builder works for plain queries and joins.
+function sessionsWhere(c: any, alias = ""): { sql: string; params: any[] } {
+  const a = alias ? `${alias}.` : "";
+  const where: string[] = [];
+  const params: any[] = [];
+  const q = c.req.query("q")?.trim();
+  if (q) {
+    where.push(`(${a}id LIKE ? ESCAPE '\\' OR ${a}user_id LIKE ? ESCAPE '\\')`);
+    const like = `%${q.replace(/[%_]/g, "\\$&")}%`;
+    params.push(like, like);
+  }
+  const user = c.req.query("user");
+  if (user) {
+    where.push(`${a}user_id = ?`);
+    params.push(user);
+  }
+  const since = Number(c.req.query("since") ?? 0);
+  if (since > 0) {
+    where.push(`${a}updated_at >= ?`);
+    params.push(since);
+  }
+  const until = Number(c.req.query("until") ?? 0);
+  if (until > 0) {
+    where.push(`${a}updated_at <= ?`);
+    params.push(until);
+  }
+  return { sql: where.length ? `WHERE ${where.join(" AND ")}` : "", params };
+}
+
 api.get("/sessions", (c) => {
   const limit = Math.min(Number(c.req.query("limit") ?? 50), 200);
   const offset = Number(c.req.query("offset") ?? 0);
+  const w = sessionsWhere(c);
   const rows = db
     .prepare(
-      `SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+      `SELECT * FROM sessions ${w.sql} ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
     )
-    .all(limit, offset);
-  const total = (db.prepare(`SELECT COUNT(*) AS n FROM sessions`).get() as any).n;
+    .all(...w.params, limit, offset);
+  const total = (
+    db.prepare(`SELECT COUNT(*) AS n FROM sessions ${w.sql}`).get(...w.params) as any
+  ).n;
   return c.json({ sessions: rows, total });
+});
+
+// Header-strip metrics for the Sessions tab. Honors the same filters as
+// /sessions so the strip reflects the current view.
+api.get("/sessions/aggregates", (c) => {
+  const w = sessionsWhere(c);
+  const totals = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS count,
+         COALESCE(SUM(total_cost),0) AS total_cost,
+         COALESCE(SUM(total_input_tokens + total_output_tokens),0) AS total_tokens,
+         COALESCE(SUM(total_cache_read_tokens),0) AS total_cache_read_tokens,
+         COALESCE(SUM(total_cache_creation_tokens),0) AS total_cache_creation_tokens,
+         COALESCE(AVG(request_count),0) AS avg_requests
+       FROM sessions ${w.sql}`,
+    )
+    .get(...w.params) as any;
+  // Top model is computed across the requests inside the matched sessions.
+  const wj = sessionsWhere(c, "s");
+  const topModel = db
+    .prepare(
+      `SELECT r.model, COUNT(*) AS n
+       FROM requests r
+       JOIN sessions s ON s.id = r.session_id
+       ${wj.sql}
+       GROUP BY r.model ORDER BY n DESC LIMIT 1`,
+    )
+    .get(...wj.params) as { model: string; n: number } | undefined;
+  return c.json({
+    count: totals.count,
+    total_cost: totals.total_cost,
+    total_tokens: totals.total_tokens,
+    total_cache_read_tokens: totals.total_cache_read_tokens,
+    total_cache_creation_tokens: totals.total_cache_creation_tokens,
+    avg_requests_per_session: Number(totals.avg_requests),
+    top_model: topModel?.model ?? null,
+  });
 });
 
 // Comprehensive JSONL export of a session — every captured event as one line.
@@ -99,6 +237,8 @@ api.get("/sessions/:id/export.jsonl", (c) => {
       request_count: session.request_count,
       total_input_tokens: session.total_input_tokens,
       total_output_tokens: session.total_output_tokens,
+      total_cache_read_tokens: session.total_cache_read_tokens ?? 0,
+      total_cache_creation_tokens: session.total_cache_creation_tokens ?? 0,
       total_cost_usd: session.total_cost,
     },
     nebula_version: 1,
@@ -124,7 +264,12 @@ api.get("/sessions/:id/export.jsonl", (c) => {
       finished_at_ms: r.finished_at,
       latency_ms: r.latency_ms,
       finish_reason: r.finish_reason,
-      tokens: { input: r.input_tokens, output: r.output_tokens },
+      tokens: {
+        input: r.input_tokens,
+        output: r.output_tokens,
+        cache_read: r.cache_read_tokens,
+        cache_creation: r.cache_creation_tokens,
+      },
       cost_usd: r.cost,
       params: pickParams(req),
     });
@@ -200,7 +345,12 @@ api.get("/sessions/:id/export.jsonl", (c) => {
       sequence: seq,
       finished_at_ms: r.finished_at,
       finish_reason: r.finish_reason,
-      tokens: { input: r.input_tokens, output: r.output_tokens },
+      tokens: {
+        input: r.input_tokens,
+        output: r.output_tokens,
+        cache_read: r.cache_read_tokens,
+        cache_creation: r.cache_creation_tokens,
+      },
       cost_usd: r.cost,
     });
   }
@@ -224,46 +374,138 @@ api.get("/sessions/:id", (c) => {
     .prepare(
       `SELECT id, session_id, user_id, provider, model, status, error,
               streamed, started_at, finished_at, latency_ms,
-              input_tokens, output_tokens, cost, finish_reason
+              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+              cost, finish_reason
        FROM requests WHERE session_id = ? ORDER BY started_at ASC`,
     )
     .all(id);
   return c.json({ session, requests });
 });
 
-api.get("/requests", (c) => {
+// Join: raw session row + analyzed insights (when present). Lets the engineer-
+// grade SessionDetail page surface manager context inline without two roundtrips.
+api.get("/sessions/:id/insights", (c) => {
+  const id = c.req.param("id");
+  const insights = getInsightsSession(id);
+  return c.json({ session: insights });
+});
+
+// Per-user insights bundle: the User analytics record plus their analyzed
+// sessions, optionally filtered by friction tag. The `id` parameter accepts
+// either the insights id ("u3") or the raw user id ("alice").
+api.get("/users/:id/insights", (c) => {
+  const idOrRaw = c.req.param("id");
+  const friction = c.req.query("friction")?.trim() || undefined;
   const limit = Math.min(Number(c.req.query("limit") ?? 50), 200);
   const offset = Number(c.req.query("offset") ?? 0);
-  const model = c.req.query("model");
-  const status = c.req.query("status");
-  const session = c.req.query("session");
+  const insightsId = resolveInsightsUserId(idOrRaw);
+  if (!insightsId) {
+    return c.json({ user: null, sessions: [], total: 0 });
+  }
+  const user = getInsightsUser(insightsId);
+  const { sessions, total } = listSessionsForUser(insightsId, {
+    friction,
+    limit,
+    offset,
+  });
+  return c.json({ user, sessions, total });
+});
+
+function requestsWhere(c: any): { sql: string; params: any[] } {
   const where: string[] = [];
   const params: any[] = [];
+  const model = c.req.query("model");
   if (model) {
     where.push("model = ?");
     params.push(model);
   }
+  const status = c.req.query("status");
   if (status) {
     where.push("status = ?");
     params.push(status);
   }
+  const session = c.req.query("session");
   if (session) {
     where.push("session_id = ?");
     params.push(session);
   }
-  const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const user = c.req.query("user");
+  if (user) {
+    where.push("user_id = ?");
+    params.push(user);
+  }
+  const q = c.req.query("q")?.trim();
+  if (q) {
+    where.push(
+      "(id LIKE ? ESCAPE '\\' OR session_id LIKE ? ESCAPE '\\' OR model LIKE ? ESCAPE '\\')",
+    );
+    const like = `%${q.replace(/[%_]/g, "\\$&")}%`;
+    params.push(like, like, like);
+  }
+  const since = Number(c.req.query("since") ?? 0);
+  if (since > 0) {
+    where.push("started_at >= ?");
+    params.push(since);
+  }
+  const until = Number(c.req.query("until") ?? 0);
+  if (until > 0) {
+    where.push("started_at <= ?");
+    params.push(until);
+  }
+  return { sql: where.length ? `WHERE ${where.join(" AND ")}` : "", params };
+}
+
+api.get("/requests", (c) => {
+  const limit = Math.min(Number(c.req.query("limit") ?? 50), 200);
+  const offset = Number(c.req.query("offset") ?? 0);
+  const w = requestsWhere(c);
   const rows = db
     .prepare(
       `SELECT id, session_id, user_id, provider, model, status, error,
               streamed, started_at, finished_at, latency_ms,
-              input_tokens, output_tokens, cost, finish_reason
-       FROM requests ${w} ORDER BY started_at DESC LIMIT ? OFFSET ?`,
+              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+              cost, finish_reason
+       FROM requests ${w.sql} ORDER BY started_at DESC LIMIT ? OFFSET ?`,
     )
-    .all(...params, limit, offset);
+    .all(...w.params, limit, offset);
   const total = (
-    db.prepare(`SELECT COUNT(*) AS n FROM requests ${w}`).get(...params) as any
+    db.prepare(`SELECT COUNT(*) AS n FROM requests ${w.sql}`).get(...w.params) as any
   ).n;
   return c.json({ requests: rows, total });
+});
+
+api.get("/requests/aggregates", (c) => {
+  const w = requestsWhere(c);
+  const totals = db
+    .prepare(
+      `SELECT
+         COUNT(*) AS count,
+         COALESCE(SUM(cost),0) AS total_cost,
+         COALESCE(AVG(latency_ms),0) AS avg_latency_ms,
+         COALESCE(SUM(CASE WHEN status='error' THEN 1 ELSE 0 END),0) AS error_count
+       FROM requests ${w.sql}`,
+    )
+    .get(...w.params) as any;
+  // p95 — pull all matching latencies, sorted ASC, pick the right index.
+  const w2sql = w.sql
+    ? `${w.sql} AND latency_ms IS NOT NULL`
+    : `WHERE latency_ms IS NOT NULL`;
+  const allLat = db
+    .prepare(`SELECT latency_ms FROM requests ${w2sql} ORDER BY latency_ms ASC`)
+    .all(...w.params) as { latency_ms: number }[];
+  const p95 = allLat.length
+    ? allLat[Math.min(allLat.length - 1, Math.floor(0.95 * allLat.length))]!
+        .latency_ms
+    : 0;
+  const error_rate = totals.count > 0 ? totals.error_count / totals.count : 0;
+  return c.json({
+    count: totals.count,
+    total_cost: totals.total_cost,
+    avg_latency_ms: Number(totals.avg_latency_ms),
+    p95_latency_ms: p95,
+    error_count: totals.error_count,
+    error_rate,
+  });
 });
 
 api.get("/requests/:id", (c) => {
@@ -299,6 +541,8 @@ api.get("/timeseries", (c) => {
          COALESCE(SUM(cost),0) AS cost,
          COALESCE(SUM(input_tokens),0) AS input_tokens,
          COALESCE(SUM(output_tokens),0) AS output_tokens,
+         COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
+         COALESCE(SUM(cache_creation_tokens),0) AS cache_creation_tokens,
          COALESCE(AVG(latency_ms),0) AS avg_latency_ms,
          SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors
        FROM requests
@@ -425,7 +669,12 @@ api.get("/tools", (c) => {
     }
   }
 
-  const result = Object.values(byTool)
+  const limit = Math.min(Number(c.req.query("limit") ?? 50), 500);
+  const offset = Number(c.req.query("offset") ?? 0);
+  const q = c.req.query("q")?.trim().toLowerCase();
+  const errorsOnly = c.req.query("errorsOnly") === "1";
+
+  let result = Object.values(byTool)
     .map((t) => ({
       name: t.name,
       count: t.count,
@@ -437,10 +686,100 @@ api.get("/tools", (c) => {
       sample_args: t.sample_args,
     }))
     .sort((a, b) => b.count - a.count);
-  return c.json({ tools: result });
+  if (q) result = result.filter((t) => t.name.toLowerCase().includes(q));
+  if (errorsOnly) result = result.filter((t) => t.error_rate > 0);
+  const total = result.length;
+  const page = result.slice(offset, offset + limit);
+  return c.json({ tools: page, total });
 });
 
+api.get("/tools/aggregates", (c) => {
+  const rows = db
+    .prepare(
+      `SELECT id, latency_ms, cost, tool_calls_json, status
+       FROM requests
+       WHERE tool_calls_json IS NOT NULL`,
+    )
+    .all() as Array<{
+      id: string;
+      latency_ms: number | null;
+      cost: number | null;
+      tool_calls_json: string;
+      status: string;
+    }>;
+  let total_calls = 0;
+  let error_calls = 0;
+  let total_cost = 0;
+  const names = new Set<string>();
+  for (const r of rows) {
+    let calls: any[] = [];
+    try {
+      calls = JSON.parse(r.tool_calls_json);
+    } catch {
+      continue;
+    }
+    for (const tc of calls) {
+      total_calls++;
+      const name = tc.function?.name ?? tc.name;
+      if (name) names.add(name);
+      if (r.status === "error") error_calls++;
+      if (r.cost != null) total_cost += r.cost / Math.max(1, calls.length);
+    }
+  }
+  return c.json({
+    count: names.size,
+    total_calls,
+    total_cost,
+    error_rate: total_calls > 0 ? error_calls / total_calls : 0,
+  });
+});
+
+// Users-by-friction support: when ?friction=<tag> is set, restrict to the
+// raw_user_ids that have at least one analyzed insights_session containing
+// that tag. The intersection happens in JS to keep the SQL straightforward.
+function userIdsForFriction(friction: string): Set<string> {
+  // insights_sessions.json contains a SessionMeta. We loaded it via JSON_EXTRACT
+  // when SQLite supports it; fall back to substring match otherwise. The
+  // friction list lives at .friction[*].
+  const rows = db
+    .prepare(
+      `SELECT s.user_id AS insights_user_id, u.raw_user_id AS raw_user_id
+       FROM insights_sessions s
+       JOIN insights_users u ON u.id = s.user_id
+       WHERE instr(s.json, ?) > 0`,
+    )
+    .all(`"${friction}"`) as Array<{
+      insights_user_id: string;
+      raw_user_id: string | null;
+    }>;
+  const out = new Set<string>();
+  for (const r of rows) if (r.raw_user_id) out.add(r.raw_user_id);
+  return out;
+}
+
 api.get("/users", (c) => {
+  const limit = Math.min(Number(c.req.query("limit") ?? 50), 200);
+  const offset = Number(c.req.query("offset") ?? 0);
+  const q = c.req.query("q")?.trim();
+  const friction = c.req.query("friction")?.trim();
+
+  const where: string[] = [];
+  const params: any[] = [];
+  if (q) {
+    where.push("user_id LIKE ? ESCAPE '\\'");
+    params.push(`%${q.replace(/[%_]/g, "\\$&")}%`);
+  }
+  if (friction) {
+    const ids = userIdsForFriction(friction);
+    if (ids.size === 0) {
+      return c.json({ users: [], total: 0 });
+    }
+    const placeholders = Array.from(ids, () => "?").join(",");
+    where.push(`user_id IN (${placeholders})`);
+    params.push(...ids);
+  }
+  const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
   const rows = db
     .prepare(
       `SELECT
@@ -448,17 +787,57 @@ api.get("/users", (c) => {
          COUNT(*) AS request_count,
          COUNT(DISTINCT session_id) AS session_count,
          COALESCE(SUM(cost),0) AS cost,
-         COALESCE(SUM(input_tokens+output_tokens),0) AS tokens,
+         COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) AS tokens,
+         COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
+         COALESCE(SUM(cache_creation_tokens),0) AS cache_creation_tokens,
          COALESCE(AVG(latency_ms),0) AS avg_latency_ms,
          SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors,
          MAX(started_at) AS last_seen
        FROM requests
+       ${w}
        GROUP BY user_id
        ORDER BY request_count DESC
-       LIMIT 50`,
+       LIMIT ? OFFSET ?`,
     )
-    .all();
-  return c.json({ users: rows });
+    .all(...params, limit, offset);
+  // total = number of distinct user buckets matching the WHERE
+  const total = (
+    db
+      .prepare(`SELECT COUNT(DISTINCT user_id) AS n FROM requests ${w}`)
+      .get(...params) as any
+  ).n;
+  return c.json({ users: rows, total });
+});
+
+api.get("/users/aggregates", (c) => {
+  const totals = db
+    .prepare(
+      `SELECT
+         COUNT(DISTINCT user_id) AS active,
+         COALESCE(SUM(cost),0) AS total_cost,
+         COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) AS total_tokens,
+         COALESCE(SUM(cache_read_tokens),0) AS total_cache_read_tokens,
+         COALESCE(SUM(cache_creation_tokens),0) AS total_cache_creation_tokens
+       FROM requests`,
+    )
+    .get() as any;
+  const top = db
+    .prepare(
+      `SELECT user_id, SUM(cost) AS cost
+       FROM requests
+       GROUP BY user_id
+       ORDER BY cost DESC LIMIT 1`,
+    )
+    .get() as { user_id: string | null; cost: number } | undefined;
+  return c.json({
+    active: totals.active,
+    total_cost: totals.total_cost,
+    total_tokens: totals.total_tokens,
+    total_cache_read_tokens: totals.total_cache_read_tokens,
+    total_cache_creation_tokens: totals.total_cache_creation_tokens,
+    top_user_id: top?.user_id ?? null,
+    top_user_cost: top?.cost ?? 0,
+  });
 });
 
 api.get("/search", (c) => {

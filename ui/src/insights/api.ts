@@ -23,7 +23,7 @@ export const insightsApi = {
     fetch(`/api/insights/sessions/${encodeURIComponent(sessionId)}`).then(
       j<{ session: SessionMeta; transcript: Transcript | null }>,
     ),
-  postAnalyze: (body: { all?: boolean; sessionId?: string }) =>
+  postAnalyze: (body: { all?: boolean; sessionId?: string; force?: boolean }) =>
     fetch("/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -32,5 +32,13 @@ export const insightsApi = {
   getJob: (id: string) =>
     fetch(`/api/jobs/${encodeURIComponent(id)}`).then(j<Job>),
   listJobs: () => fetch("/api/jobs").then(j<{ jobs: Job[] }>),
+  cancelJob: (id: string) =>
+    fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }).then(
+      j<Job>,
+    ),
+  deleteJob: (id: string) =>
+    fetch(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }).then(
+      j<{ ok: true }>,
+    ),
   clear: () => fetch("/api/insights", { method: "DELETE" }).then(j<{ ok: true }>),
 };

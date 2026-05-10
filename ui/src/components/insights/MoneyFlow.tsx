@@ -10,6 +10,7 @@ import {
 } from "d3-sankey";
 import type { Dataset, User } from "../../insights/types";
 import { formatUsd, wasteTypeLabel } from "../../insights/format";
+import { PALETTE, type Palette } from "../../insights/palette";
 
 type Lens = "reason" | "team" | "engineer" | "outcome";
 
@@ -33,16 +34,16 @@ interface LinkDatum {
   kind: "productive" | "wasted";
 }
 
-const COLORS = {
-  total: "#111111",
-  productive: "#1F7A3A",
-  wasted: "#B23A1F",
-  productiveSoft: "#B8F5C9",
-  wastedSoft: "#FFB7A8",
-};
-
 export function MoneyFlow({ data, onOpenWaste, onOpenUser }: Props) {
   const [lens, setLens] = useState<Lens>("reason");
+  const pal = PALETTE;
+  const COLORS = {
+    total: pal.total,
+    productive: pal.productive,
+    wasted: pal.wasted,
+    productiveSoft: pal.productiveSoft,
+    wastedSoft: pal.wastedSoft,
+  };
   const a = data.aggregates;
   const total = a.totalCostUsd;
   const wasted = a.totalWasteUsd;
@@ -200,16 +201,16 @@ export function MoneyFlow({ data, onOpenWaste, onOpenUser }: Props) {
                           : n.splitKind === "waste"
                             ? COLORS.wastedSoft
                             : COLORS.productiveSoft;
+                  // A split is clickable when its payload carries a target —
+                  // a wasteType opens the waste drawer, a userId opens the
+                  // user drawer. Works for both productive and waste sides.
                   const interactable =
                     n.category === "split" &&
-                    ((lens === "reason" && n.splitKind === "waste") ||
-                      lens === "engineer");
+                    !!(n.payload?.wasteType || n.payload?.userId);
                   const onClick = () => {
                     if (!n.payload) return;
-                    if (lens === "reason" && n.payload.wasteType)
-                      onOpenWaste(n.payload.wasteType);
-                    else if (lens === "engineer" && n.payload.userId)
-                      onOpenUser(n.payload.userId);
+                    if (n.payload.wasteType) onOpenWaste(n.payload.wasteType);
+                    else if (n.payload.userId) onOpenUser(n.payload.userId);
                   };
                   return (
                     <g
@@ -223,11 +224,18 @@ export function MoneyFlow({ data, onOpenWaste, onOpenUser }: Props) {
                         width={w}
                         height={h}
                         fill={fill}
-                        stroke="#111"
+                        stroke={pal.outline}
                         strokeWidth={2}
                         rx={3}
                       />
-                      <NodeLabel node={n} x0={x0} x1={x1} y0={y0} h={h} />
+                      <NodeLabel
+                        node={n}
+                        x0={x0}
+                        x1={x1}
+                        y0={y0}
+                        h={h}
+                        pal={pal}
+                      />
                     </g>
                   );
                 })}
@@ -246,21 +254,24 @@ function NodeLabel({
   x1,
   y0,
   h,
+  pal,
 }: {
   node: SankeyNode<NodeDatum, LinkDatum>;
   x0: number;
   x1: number;
   y0: number;
   h: number;
+  pal: Palette;
 }) {
   const value = node.value ?? 0;
+  const ink = pal.axisText;
   if (node.category === "total") {
     return (
       <g pointerEvents="none">
         <text
           x={x1 + 10}
           y={y0 + 16}
-          fill="#111"
+          fill={ink}
           fontSize="10"
           fontWeight={700}
           style={{ letterSpacing: "0.18em", textTransform: "uppercase" }}
@@ -270,7 +281,7 @@ function NodeLabel({
         <text
           x={x1 + 10}
           y={y0 + 38}
-          fill="#111"
+          fill={ink}
           fontSize="20"
           fontWeight={700}
         >
@@ -281,13 +292,13 @@ function NodeLabel({
   }
   if (node.category === "productive" || node.category === "wasted") {
     const isWaste = node.category === "wasted";
-    const color = isWaste ? "#B23A1F" : "#1F7A3A";
+    const color = isWaste ? pal.wasted : pal.productive;
     return (
       <g pointerEvents="none">
         <text
           x={x1 + 10}
           y={y0 + 14}
-          fill="#111"
+          fill={ink}
           fontSize="10"
           fontWeight={700}
           style={{ letterSpacing: "0.18em", textTransform: "uppercase" }}
@@ -313,7 +324,7 @@ function NodeLabel({
         x={x0 - 8}
         y={labelY}
         textAnchor="end"
-        fill="#111"
+        fill={ink}
         fontSize="12"
         fontWeight={600}
       >
@@ -323,7 +334,8 @@ function NodeLabel({
         x={x0 - 8}
         y={labelY + 13}
         textAnchor="end"
-        fill="#11111199"
+        fill={ink}
+        fillOpacity={0.6}
         fontSize="10.5"
         style={{ fontFeatureSettings: '"tnum"' }}
       >
@@ -333,6 +345,9 @@ function NodeLabel({
   );
 }
 
+// Both sides — for each lens we now expose where the productive money flows
+// in addition to where the waste flows. Shows the manager not just "we lost
+// $X" but "we got $Y of value here".
 function lensSplits(
   lens: Lens,
   data: Dataset,
@@ -345,10 +360,13 @@ function lensSplits(
   payload?: { wasteType?: string; userId?: string };
 }[] {
   const a = data.aggregates;
+
   if (lens === "reason") {
-    return Object.entries(a.wasteByType)
+    // Waste by category + productive by sessionType (what kind of work the
+    // money actually delivered).
+    const waste = Object.entries(a.wasteByType)
       .map(([k, v]) => ({
-        key: k,
+        key: `waste:${k}`,
         label: wasteTypeLabel(k),
         usd: v.usd,
         kind: "waste" as const,
@@ -356,27 +374,70 @@ function lensSplits(
       }))
       .filter((s) => s.usd > 0)
       .sort((x, y) => y.usd - x.usd);
+    const productiveByType = new Map<string, number>();
+    for (const s of data.sessions) {
+      const productive = Math.max(0, s.costUsd - s.wasteUsd);
+      productiveByType.set(
+        s.sessionType,
+        (productiveByType.get(s.sessionType) ?? 0) + productive,
+      );
+    }
+    const productive = [...productiveByType.entries()]
+      .map(([k, usd]) => ({
+        key: `prod:${k}`,
+        label: sessionTypeLabel(k),
+        usd,
+        kind: "productive" as const,
+      }))
+      .filter((s) => s.usd > 0)
+      .sort((x, y) => y.usd - x.usd);
+    return [...productive, ...waste];
   }
+
   if (lens === "team") {
-    const map = new Map<string, number>();
+    const wasteByTeam = new Map<string, number>();
+    const prodByTeam = new Map<string, number>();
     for (const s of data.sessions) {
       const team = byUserId.get(s.userId)?.team ?? "—";
-      map.set(team, (map.get(team) ?? 0) + s.wasteUsd);
+      const prod = Math.max(0, s.costUsd - s.wasteUsd);
+      wasteByTeam.set(team, (wasteByTeam.get(team) ?? 0) + s.wasteUsd);
+      prodByTeam.set(team, (prodByTeam.get(team) ?? 0) + prod);
     }
-    return [...map.entries()]
+    const productive = [...prodByTeam.entries()]
       .map(([team, usd]) => ({
-        key: `team:${team}`,
+        key: `prod-team:${team}`,
+        label: team,
+        usd,
+        kind: "productive" as const,
+      }))
+      .filter((s) => s.usd > 0)
+      .sort((x, y) => y.usd - x.usd);
+    const waste = [...wasteByTeam.entries()]
+      .map(([team, usd]) => ({
+        key: `waste-team:${team}`,
         label: team,
         usd,
         kind: "waste" as const,
       }))
       .filter((s) => s.usd > 0)
       .sort((x, y) => y.usd - x.usd);
+    return [...productive, ...waste];
   }
+
   if (lens === "engineer") {
-    return data.users
+    const productive = data.users
       .map((u) => ({
-        key: u.id,
+        key: `prod-eng:${u.id}`,
+        label: u.displayName,
+        usd: Math.max(0, u.totalCostUsd - u.totalWasteUsd),
+        kind: "productive" as const,
+        payload: { userId: u.id },
+      }))
+      .filter((s) => s.usd > 0)
+      .sort((x, y) => y.usd - x.usd);
+    const waste = data.users
+      .map((u) => ({
+        key: `waste-eng:${u.id}`,
         label: u.displayName,
         usd: u.totalWasteUsd,
         kind: "waste" as const,
@@ -384,11 +445,13 @@ function lensSplits(
       }))
       .filter((s) => s.usd > 0)
       .sort((x, y) => y.usd - x.usd);
+    return [...productive, ...waste];
   }
+
+  // outcome — already mixed (productive vs waste depends on outcome value).
   const map: Record<string, number> = {};
   for (const s of data.sessions) {
-    const productivePart = Math.max(0, s.costUsd - s.wasteUsd);
-    map[s.outcome] = (map[s.outcome] ?? 0) + productivePart;
+    map[s.outcome] = (map[s.outcome] ?? 0) + s.costUsd;
   }
   const order = ["fully", "mostly", "partial", "unclear", "none"];
   return order
@@ -402,6 +465,23 @@ function lensSplits(
     }));
 }
 
+function sessionTypeLabel(t: string): string {
+  switch (t) {
+    case "single_task":
+      return "Single task";
+    case "multi_task":
+      return "Multi task";
+    case "iterative":
+      return "Iterative work";
+    case "exploration":
+      return "Exploration";
+    case "quick_q":
+      return "Quick question";
+    default:
+      return t.replace(/_/g, " ");
+  }
+}
+
 // ---------- Spend-vs-win-rate scatter ----------
 
 export function SpendWinScatter({
@@ -413,6 +493,7 @@ export function SpendWinScatter({
 }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState<{ w: number; h: number }>({ w: 900, h: 360 });
+  const pal = PALETTE;
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
@@ -444,14 +525,14 @@ export function SpendWinScatter({
 
   const personaColor = (p: string) =>
     p === "power"
-      ? "#1F7A3A"
+      ? pal.persona.power
       : p === "active"
-        ? "#2C68C8"
+        ? pal.persona.active
         : p === "stuck"
-          ? "#B47A12"
+          ? pal.persona.stuck
           : p === "misuser"
-            ? "#B23A1F"
-            : "#888";
+            ? pal.persona.misuser
+            : pal.persona.lurker;
 
   return (
     <div className="scatter-card" ref={wrapRef}>
@@ -468,7 +549,7 @@ export function SpendWinScatter({
             x2={w - pad.r}
             y1={yScale(v)}
             y2={yScale(v)}
-            stroke="rgba(17,17,17,0.08)"
+            stroke={pal.gridLine}
             strokeWidth={1}
           />
         ))}
@@ -477,10 +558,17 @@ export function SpendWinScatter({
           x2={w - pad.r}
           y1={h - pad.b}
           y2={h - pad.b}
-          stroke="#111"
+          stroke={pal.axisLine}
           strokeWidth={2}
         />
-        <line x1={pad.l} x2={pad.l} y1={pad.t} y2={h - pad.b} stroke="#111" strokeWidth={2} />
+        <line
+          x1={pad.l}
+          x2={pad.l}
+          y1={pad.t}
+          y2={h - pad.b}
+          stroke={pal.axisLine}
+          strokeWidth={2}
+        />
         {yTicks.map((v) => (
           <text
             key={`y-${v}`}
@@ -489,8 +577,8 @@ export function SpendWinScatter({
             textAnchor="end"
             dominantBaseline="middle"
             fontSize="10.5"
-            fill="#111"
-            opacity={0.65}
+            fill={pal.axisText}
+            opacity={0.7}
           >
             {Math.round(v * 100)}%
           </text>
@@ -502,8 +590,8 @@ export function SpendWinScatter({
             y={h - pad.b + 18}
             textAnchor="middle"
             fontSize="10.5"
-            fill="#111"
-            opacity={0.65}
+            fill={pal.axisText}
+            opacity={0.7}
           >
             {formatUsd(v, { decimals: 0 })}
           </text>
@@ -512,7 +600,7 @@ export function SpendWinScatter({
           transform={`translate(${pad.l - 44}, ${(pad.t + h - pad.b) / 2}) rotate(-90)`}
           textAnchor="middle"
           fontSize="10"
-          fill="#111"
+          fill={pal.axisText}
           fontWeight={700}
           style={{ letterSpacing: "0.22em", textTransform: "uppercase" }}
         >
@@ -523,7 +611,7 @@ export function SpendWinScatter({
           y={h - 10}
           textAnchor="middle"
           fontSize="10"
-          fill="#111"
+          fill={pal.axisText}
           fontWeight={700}
           style={{ letterSpacing: "0.22em", textTransform: "uppercase" }}
         >
@@ -548,7 +636,7 @@ export function SpendWinScatter({
                 r={r}
                 fill={color}
                 fillOpacity={0.85}
-                stroke="#111"
+                stroke={pal.outline}
                 strokeWidth={2}
               />
               <text
@@ -556,7 +644,7 @@ export function SpendWinScatter({
                 y={cy - 1}
                 textAnchor={flipLeft ? "end" : "start"}
                 fontSize="12"
-                fill="#111"
+                fill={pal.axisText}
                 fontWeight={600}
               >
                 {u.displayName}
@@ -566,8 +654,8 @@ export function SpendWinScatter({
                 y={cy + 13}
                 textAnchor={flipLeft ? "end" : "start"}
                 fontSize="10.5"
-                fill="#111"
-                opacity={0.6}
+                fill={pal.axisText}
+                opacity={0.65}
                 style={{ fontFeatureSettings: '"tnum"' }}
               >
                 {Math.round(u.winRate * 100)}% · {formatUsd(u.totalCostUsd, { decimals: 0 })}

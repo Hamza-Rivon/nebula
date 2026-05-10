@@ -27,6 +27,10 @@
 }
 
 html, body, #root { height: 100%; }
+/* Always reserve room for the vertical scrollbar so loading more rows in an
+ * infinite-scroll table doesn't shove the sidebar (or other layout) sideways
+ * the first time content overflows the viewport. */
+html { scrollbar-gutter: stable; }
 body {
   background: var(--color-paper);
   color: var(--color-ink);
@@ -125,6 +129,97 @@ body {
 }
 .nb-table tbody tr { cursor: pointer; transition: background 80ms ease; }
 .nb-table tbody tr:hover { background: #FFF7DA; }
+/* Header + cells share a single vertical alignment so a row with multi-line
+ * content (id + timestamp etc.) doesn't shove single-line cells out of line
+ * with the header text. */
+.nb-table th,
+.nb-table td { vertical-align: middle; }
+
+/* Metric strip — small chips of headline numbers above a long table. */
+.metric-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: .8rem;
+  margin-bottom: 1rem;
+}
+.metric-chip {
+  background: var(--color-mist);
+  border: 2.5px solid var(--color-ink);
+  border-radius: 12px;
+  box-shadow: 4px 4px 0 0 var(--color-ink);
+  padding: .8rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: .15rem;
+  min-width: 0;
+}
+.metric-label {
+  font-size: .68rem;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  opacity: .7;
+}
+.metric-value {
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  font-size: 1.55rem;
+  font-weight: 700;
+  font-feature-settings: "tnum";
+  line-height: 1.1;
+}
+.metric-hint {
+  font-size: .72rem;
+  opacity: .6;
+  margin-top: .1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Filter row — a horizontal group of inputs/selects/buttons above a table. */
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+.filter-row .nb-input,
+.filter-row select.nb-input { padding: .35rem .65rem; font-size: .85rem; }
+.filter-row .grow { flex: 1 1 200px; min-width: 0; }
+
+/* Friction chips — small, removable, clickable. */
+.friction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .15rem .55rem;
+  border: 2px solid var(--color-ink);
+  border-radius: 999px;
+  background: #fff;
+  font-size: .72rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 80ms ease, box-shadow 80ms ease;
+}
+.friction-chip:hover {
+  transform: translate(-1px, -1px);
+  box-shadow: 2px 2px 0 0 var(--color-ink);
+}
+.friction-chip.active { background: var(--color-butter); }
+.friction-chip-x { opacity: .5; font-weight: 800; }
+
+/* Sentinel row for infinite scroll — invisible, just gives the IO something
+ * to observe. */
+.infinite-sentinel { height: 1px; }
+
+/* A subtle "loading more…" footer row inside an infinite-scroll table. */
+.table-loadmore {
+  text-align: center;
+  font-size: .8rem;
+  opacity: .55;
+  padding: .8rem 0;
+}
 
 .nb-tag {
   display: inline-block;

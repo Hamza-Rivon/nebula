@@ -31,10 +31,7 @@ export default function InsightsPage({
         <div>
           <div className="page-eyebrow">Capability intel · partner brief</div>
           <h1 className="page-title">Insights overview</h1>
-          <p className="page-subtitle">
-            Three answers from the firm's session log: who extracts value, where
-            spend is leaking, and what no one has figured out yet.
-          </p>
+
         </div>
         <div className="daterange">
           <span className="daterange-dot" />

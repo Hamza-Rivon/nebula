@@ -1,38 +1,23 @@
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { api, type RequestRow } from "../api";
+import { useQuery } from "@tanstack/react-query";
 import { EmptyState } from "../components/EmptyState";
 import { fmt } from "../format";
+import { searchQuery } from "../queries";
 
 export function SearchPage() {
   const [params, setParams] = useSearchParams();
   const q = params.get("q") ?? "";
-  const [rows, setRows] = useState<RequestRow[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
   const [draft, setDraft] = useState(q);
 
   useEffect(() => {
     setDraft(q);
-    if (!q.trim()) {
-      setRows([]);
-      return;
-    }
-    let alive = true;
-    setLoading(true);
-    api
-      .search(q)
-      .then((r) => {
-        if (!alive) return;
-        setRows(r.requests);
-        setErr(null);
-      })
-      .catch((e) => alive && setErr(String(e)))
-      .finally(() => alive && setLoading(false));
-    return () => {
-      alive = false;
-    };
   }, [q]);
+
+  const search = useQuery(searchQuery(q));
+  const rows = search.data?.requests ?? [];
+  const loading = search.isLoading && !!q.trim();
+  const err = search.error ? String(search.error) : null;
 
   return (
     <div className="space-y-4">

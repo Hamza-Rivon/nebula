@@ -8,6 +8,7 @@ interface Props {
   className?: string;
 }
 
+// Soft-pop background pool for the avatar disc.
 const BG = ["FFE066", "B8F5C9", "A0E7FF", "C8B6FF", "FFB7A8"];
 
 export function Avatar({ seed, size = 36, className }: Props) {

@@ -1,17 +1,12 @@
-import { useEffect, useState } from "react";
-import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Cell,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-import { api, type ToolUsage } from "../api";
+import { useMemo, useState } from "react";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { BarChart } from "../charts/BarChart";
+import { type ToolUsage } from "../api";
 import { EmptyState } from "../components/EmptyState";
+import { MetricChips } from "../components/MetricChips";
 import { fmt } from "../format";
+import { flattenTools, toolsAggQuery, toolsListQuery } from "../queries";
+import { useInfiniteScroll } from "../useInfiniteScroll";
 
 const PALETTE = [
   "var(--color-rose)",
@@ -33,24 +28,25 @@ const CURL_DEMO = `curl http://localhost:8080/v1/chat/completions \\
   }'`;
 
 export function ToolsPage() {
-  const [tools, setTools] = useState<ToolUsage[]>([]);
-  const [err, setErr] = useState<string | null>(null);
+  const [q, setQ] = useState("");
+  const [errorsOnly, setErrorsOnly] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
 
-  useEffect(() => {
-    let alive = true;
-    const tick = () =>
-      api
-        .tools()
-        .then((r) => alive && setTools(r.tools))
-        .catch((e) => alive && setErr(String(e)));
-    tick();
-    const id = setInterval(tick, 6000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, []);
+  const filters = useMemo(
+    () => ({ q: q.trim() || undefined, errorsOnly: errorsOnly || undefined }),
+    [q, errorsOnly],
+  );
+
+  const { data: agg } = useQuery(toolsAggQuery());
+
+  const list = useInfiniteQuery(toolsListQuery(filters));
+  const { rows, total } = flattenTools(list.data?.pages);
+  const sentinelRef = useInfiniteScroll(
+    () => list.fetchNextPage(),
+    list.hasNextPage && !list.isFetchingNextPage,
+  );
+  const loading = list.isLoading || list.isFetchingNextPage;
+  const done = !list.hasNextPage;
 
   const toggle = (n: string) => {
     setOpen((s) => {
@@ -61,65 +57,86 @@ export function ToolsPage() {
     });
   };
 
-  if (err)
-    return (
-      <div className="nb-card p-5" style={{ background: "var(--color-rose)" }}>
-        Couldn't load tools: {err}
-      </div>
-    );
-
-  const top = tools.slice(0, 10).map((t, i) => ({
+  const top = rows.slice(0, 10).map((t, i) => ({
     name: t.name,
     count: t.count,
-    fill: PALETTE[i % PALETTE.length],
+    fill: PALETTE[i % PALETTE.length]!,
   }));
+
+  const errPct = agg ? Math.round(agg.error_rate * 1000) / 10 : 0;
 
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-baseline gap-3">
         <h2 className="font-display text-2xl font-bold">Tools</h2>
         <span className="nb-chip" style={{ background: "var(--color-rose)" }}>
-          {tools.length} unique
+          {fmt.num(total)} matching
         </span>
-        <p className="ml-2 text-sm opacity-70">
-          Function-call usage across the gateway. Useful for spotting which AI
-          workflows are real.
-        </p>
       </div>
 
-      <div className="nb-card nb-hover p-5">
-        <h3 className="font-display text-lg font-bold">Top tools by call count</h3>
-        {top.length === 0 ? (
-          <EmptyState
-            title="No tool calls yet"
-            hint="Send a request whose model invokes a function to populate this view."
-            curl={CURL_DEMO}
-            illustration="tools"
+      <MetricChips
+        items={[
+          {
+            label: "Unique tools",
+            value: fmt.num(agg?.count ?? 0),
+            bg: "var(--color-mist)",
+          },
+          {
+            label: "Total calls",
+            value: fmt.num(agg?.total_calls ?? 0),
+            bg: "var(--color-lavender)",
+          },
+          {
+            label: "Tool spend",
+            value: fmt.cost(agg?.total_cost ?? 0),
+            hint: "estimated, distributed across calls",
+            bg: "var(--color-lime)",
+          },
+          {
+            label: "Error rate",
+            value: `${errPct}%`,
+            bg: errPct > 5 ? "var(--color-rose)" : "var(--color-mint)",
+          },
+        ]}
+      />
+
+      <div className="filter-row">
+        <input
+          className="nb-input grow"
+          placeholder="search tool name…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
+        <label className="nb-chip" style={{ cursor: "pointer", userSelect: "none" }}>
+          <input
+            type="checkbox"
+            checked={errorsOnly}
+            onChange={(e) => setErrorsOnly(e.target.checked)}
+            style={{ marginRight: ".4rem" }}
           />
-        ) : (
-          <div className="mt-3" style={{ height: 320 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={top} margin={{ top: 8, right: 12, left: -10, bottom: 30 }}>
-                <CartesianGrid vertical={false} strokeDasharray="0" />
-                <XAxis dataKey="name" tickLine={false} angle={-25} textAnchor="end" interval={0} />
-                <YAxis tickLine={false} allowDecimals={false} />
-                <Tooltip />
-                <Bar
-                  dataKey="count"
-                  stroke="#111"
-                  strokeWidth={2}
-                  radius={2}
-                  isAnimationActive={false}
-                >
-                  {top.map((d, i) => (
-                    <Cell key={i} fill={d.fill} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+          errors only
+        </label>
+        {(q || errorsOnly) && (
+          <button
+            className="nb-chip"
+            onClick={() => {
+              setQ("");
+              setErrorsOnly(false);
+            }}
+          >
+            clear
+          </button>
         )}
       </div>
+
+      {top.length > 0 && (
+        <div className="nb-card nb-hover p-5">
+          <h3 className="font-display text-lg font-bold">Top tools by call count</h3>
+          <div className="mt-3" style={{ height: 320 }}>
+            <BarChart data={top} height={320} rotateLabels />
+          </div>
+        </div>
+      )}
 
       <div className="nb-card overflow-hidden">
         <table className="nb-table">
@@ -135,13 +152,26 @@ export function ToolsPage() {
             </tr>
           </thead>
           <tbody>
-            {tools.map((t) => (
+            {rows.map((t) => (
               <Row key={t.name} t={t} open={open.has(t.name)} onToggle={() => toggle(t.name)} />
             ))}
-            {!tools.length && (
+            {!loading && !rows.length && (
               <tr>
-                <td colSpan={7} className="py-10 text-center opacity-60">
-                  No tools recorded yet.
+                <td colSpan={7}>
+                  <EmptyState
+                    title="No tools match"
+                    hint="Send a request whose model invokes a function, or clear the filter."
+                    curl={CURL_DEMO}
+                    illustration="tools"
+                  />
+                </td>
+              </tr>
+            )}
+            {!done && rows.length > 0 && (
+              <tr>
+                <td colSpan={7} className="table-loadmore">
+                  <div ref={sentinelRef} className="infinite-sentinel" />
+                  {loading ? "loading more…" : `${rows.length} of ${total} loaded`}
                 </td>
               </tr>
             )}
@@ -179,7 +209,11 @@ function Row({ t, open, onToggle }: { t: ToolUsage; open: boolean; onToggle: () 
           </span>
         </td>
         <td>
-          {t.top_model ? <span className="nb-tag">{t.top_model}</span> : <span className="opacity-40">—</span>}
+          {t.top_model ? (
+            <span className="nb-tag">{t.top_model}</span>
+          ) : (
+            <span className="opacity-40">—</span>
+          )}
         </td>
         <td>
           <button
@@ -208,11 +242,15 @@ function Row({ t, open, onToggle }: { t: ToolUsage; open: boolean; onToggle: () 
   );
 }
 
-function prettyArgs(a: string | null): string {
-  if (!a) return "(no captured arguments)";
-  try {
-    return JSON.stringify(JSON.parse(a), null, 2);
-  } catch {
-    return a;
-  }
+function prettyArgs(samples: string[] | null): string {
+  if (!samples || samples.length === 0) return "(no captured arguments)";
+  return samples
+    .map((s) => {
+      try {
+        return JSON.stringify(JSON.parse(s), null, 2);
+      } catch {
+        return s;
+      }
+    })
+    .join("\n\n---\n\n");
 }

@@ -11,6 +11,8 @@ export type AnthropicCapture = {
   }>;
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
   finish_reason: string;
   response: any;
 };
@@ -25,6 +27,8 @@ export function teeAnthropicStream(
   const toolUses: Record<number, { id: string; name: string; argsBuf: string }> = {};
   let inputTokens = 0;
   let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
   let stopReason = "stop";
   let messageId = "";
 
@@ -56,7 +60,10 @@ export function teeAnthropicStream(
             }
             if (evt.type === "message_start") {
               messageId = evt.message?.id ?? messageId;
-              inputTokens = evt.message?.usage?.input_tokens ?? 0;
+              const u = evt.message?.usage ?? {};
+              inputTokens = u.input_tokens ?? 0;
+              cacheReadTokens = u.cache_read_input_tokens ?? 0;
+              cacheCreationTokens = u.cache_creation_input_tokens ?? 0;
             } else if (evt.type === "content_block_start") {
               const cb = evt.content_block;
               if (cb?.type === "tool_use") {
@@ -75,8 +82,16 @@ export function teeAnthropicStream(
               }
             } else if (evt.type === "message_delta") {
               if (evt.delta?.stop_reason) stopReason = evt.delta.stop_reason;
-              if (evt.usage?.output_tokens)
-                outputTokens = evt.usage.output_tokens;
+              if (evt.usage) {
+                if (evt.usage.output_tokens != null)
+                  outputTokens = evt.usage.output_tokens;
+                // message_delta carries final usage including cache fields when
+                // upstream populates them mid/end-of-stream.
+                if (evt.usage.cache_read_input_tokens != null)
+                  cacheReadTokens = evt.usage.cache_read_input_tokens;
+                if (evt.usage.cache_creation_input_tokens != null)
+                  cacheCreationTokens = evt.usage.cache_creation_input_tokens;
+              }
             }
           }
         }
@@ -100,6 +115,8 @@ export function teeAnthropicStream(
           tool_calls,
           input_tokens: inputTokens,
           output_tokens: outputTokens,
+          cache_read_tokens: cacheReadTokens,
+          cache_creation_tokens: cacheCreationTokens,
           finish_reason,
           response: {
             id: messageId,
@@ -113,7 +130,12 @@ export function teeAnthropicStream(
               })),
             ],
             stop_reason: stopReason,
-            usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+            usage: {
+              input_tokens: inputTokens,
+              output_tokens: outputTokens,
+              cache_read_input_tokens: cacheReadTokens,
+              cache_creation_input_tokens: cacheCreationTokens,
+            },
           },
         });
       }
@@ -130,11 +152,14 @@ export function captureFromAnthropicJSON(json: any): AnthropicCapture {
       tool_calls.push({ id: b.id, name: b.name, input: b.input });
   }
   const stop = json.stop_reason ?? "end_turn";
+  const u = json.usage ?? {};
   return {
     text: text.join(""),
     tool_calls,
-    input_tokens: json.usage?.input_tokens ?? 0,
-    output_tokens: json.usage?.output_tokens ?? 0,
+    input_tokens: u.input_tokens ?? 0,
+    output_tokens: u.output_tokens ?? 0,
+    cache_read_tokens: u.cache_read_input_tokens ?? 0,
+    cache_creation_tokens: u.cache_creation_input_tokens ?? 0,
     finish_reason:
       stop === "end_turn"
         ? "stop"

@@ -177,7 +177,7 @@ export interface Dataset {
 export type Job = {
   id: string;
   scope: string;
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   stage: string | null;
   total: number | null;
   done: number | null;

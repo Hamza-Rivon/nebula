@@ -1,26 +1,32 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { insightsApi } from "../insights/api";
 import type { Job } from "../insights/types";
+import { prefetchTab, type TabPath } from "../prefetch";
+import { useLiveBridge } from "../liveBridge";
+import { qk } from "../queries";
 
-type NavItem = { to: string; label: string; section: "manager" | "engineer" };
+type NavItem = { to: TabPath; label: string; section: "manager" | "engineer" };
 
 const NAV: NavItem[] = [
-  { to: "/insights",  label: "Insights",  section: "manager" },
-  { to: "/sessions",  label: "Sessions",  section: "engineer" },
-  { to: "/requests",  label: "Requests",  section: "engineer" },
-  { to: "/tools",     label: "Tools",     section: "engineer" },
-  { to: "/users",     label: "Users",     section: "engineer" },
-  { to: "/providers", label: "Providers", section: "engineer" },
+  { to: "/insights", label: "Insights", section: "manager" },
+  { to: "/sessions", label: "Sessions", section: "engineer" },
+  { to: "/requests", label: "Requests", section: "engineer" },
+  { to: "/tools",    label: "Tools",    section: "engineer" },
+  { to: "/users",    label: "Users",    section: "engineer" },
+  { to: "/jobs",     label: "Jobs",     section: "engineer" },
 ];
 
 export function Layout() {
   const navigate = useNavigate();
   const loc = useLocation();
+  const qc = useQueryClient();
   const [q, setQ] = useState("");
-  const [job, setJob] = useState<Job | null>(null);
-  const [analyzing, setAnalyzing] = useState(false);
-  const pollRef = useRef<number | null>(null);
+  const [jobId, setJobId] = useState<string | null>(null);
+
+  // Stream every SSE event into the React Query cache as an invalidation pulse.
+  useLiveBridge();
 
   const onSearch = (e: FormEvent) => {
     e.preventDefault();
@@ -29,36 +35,38 @@ export function Layout() {
     navigate(`/search?q=${encodeURIComponent(term)}`);
   };
 
-  // Poll active job until done.
-  useEffect(() => {
-    if (!job || job.status === "done" || job.status === "error") return;
-    const tick = async () => {
-      try {
-        const j = await insightsApi.getJob(job.id);
-        setJob(j);
-        if (j.status === "done" || j.status === "error") {
-          setAnalyzing(false);
-        }
-      } catch {
-        /* keep trying */
-      }
-    };
-    pollRef.current = window.setInterval(tick, 1500);
-    return () => {
-      if (pollRef.current != null) clearInterval(pollRef.current);
-    };
-  }, [job]);
+  // Poll the active job until it terminates. React Query handles the polling
+  // cadence + cancellation; we just toggle refetchInterval based on status.
+  const jobQuery = useQuery<Job | null>({
+    queryKey: ["jobs", jobId],
+    queryFn: () => (jobId ? insightsApi.getJob(jobId) : Promise.resolve(null)),
+    enabled: !!jobId,
+    refetchInterval: (q) => {
+      const j = q.state.data;
+      if (!j) return false;
+      if (j.status === "done" || j.status === "error") return false;
+      return 1500;
+    },
+  });
+  const job = jobQuery.data ?? null;
+  const analyzing = !!job && job.status !== "done" && job.status !== "error";
 
-  const onAnalyze = async () => {
-    if (analyzing) return;
-    setAnalyzing(true);
-    try {
-      const j = await insightsApi.postAnalyze({ all: true });
-      setJob(j);
-    } catch (e) {
-      setAnalyzing(false);
-      alert(`Failed to start analyze: ${String(e)}`);
+  // When the analyze pass finishes, force the insights dataset to refetch.
+  useEffect(() => {
+    if (job?.status === "done") {
+      qc.invalidateQueries({ queryKey: qk.insights.root });
     }
+  }, [job?.status, qc]);
+
+  const startAnalyze = useMutation({
+    mutationFn: () => insightsApi.postAnalyze({ all: true }),
+    onSuccess: (j) => setJobId(j.id),
+    onError: (e) => alert(`Failed to start analyze: ${String(e)}`),
+  });
+
+  const onAnalyze = () => {
+    if (analyzing || startAnalyze.isPending) return;
+    startAnalyze.mutate();
   };
 
   const manager = NAV.filter((n) => n.section === "manager");
@@ -83,6 +91,8 @@ export function Layout() {
             <NavLink
               key={n.to}
               to={n.to}
+              onMouseEnter={() => prefetchTab(n.to)}
+              onFocus={() => prefetchTab(n.to)}
               className={({ isActive }) =>
                 `sidebar-link ${isActive || loc.pathname.startsWith(n.to) ? "active" : ""}`
               }
@@ -99,6 +109,8 @@ export function Layout() {
             <NavLink
               key={n.to}
               to={n.to}
+              onMouseEnter={() => prefetchTab(n.to)}
+              onFocus={() => prefetchTab(n.to)}
               className={({ isActive }) =>
                 `sidebar-link ${isActive || loc.pathname.startsWith(n.to) ? "active" : ""}`
               }
@@ -122,11 +134,11 @@ export function Layout() {
 
           <button
             className="nb-btn"
-            disabled={analyzing}
+            disabled={analyzing || startAnalyze.isPending}
             onClick={onAnalyze}
             style={{ width: "100%", justifyContent: "center" }}
           >
-            {analyzing ? "Analyzing…" : "Re-analyze"}
+            {analyzing || startAnalyze.isPending ? "Analyzing…" : "Re-analyze"}
           </button>
 
           {job && (

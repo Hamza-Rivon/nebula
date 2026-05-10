@@ -11,14 +11,12 @@ services:
       - .env
     environment:
       NEBULA_DB_PATH: /data/nebula.db
-      # Set NEBULA_SEED_DIR (e.g. /seed) to import all *.jsonl files
-      # recursively from the mounted directory on container startup.
-      # Each (path, sha256) is imported exactly once.
-      NEBULA_SEED_DIR: ${NEBULA_SEED_DIR:-}
     volumes:
       - nebula-data:/data
-      # Mount any local folder of JSONL transcripts (read-only) at /seed.
-      # Override the host path with NEBULA_SEED_HOST_DIR in .env.
+      # Set NEBULA_SEED_HOST_DIR in .env to import every *.jsonl recursively
+      # from that host folder on container startup. Each (path, sha256) is
+      # imported once. When unset, the proxy default (./proxy/data_seed) is
+      # mounted; if that's empty/missing the seeder finds nothing and skips.
       - ${NEBULA_SEED_HOST_DIR:-./proxy/data_seed}:/seed:ro
     restart: unless-stopped
     healthcheck:

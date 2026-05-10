@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { embedMany } from "ai";
 import { z } from "zod";
@@ -6,8 +7,13 @@ import { kmeans } from "ml-kmeans";
 import { UMAP } from "umap-js";
 import { db } from "../db.js";
 import {
+  getCachedClusterLabel,
+  getCachedEmbedding,
+  getSession,
   getUserIdByRaw,
   listRawUserMappings,
+  putCachedClusterLabel,
+  putCachedEmbeddings,
   setAggregates,
   setConfig,
   setGeneratedAt,
@@ -16,6 +22,10 @@ import {
   upsertTranscript,
   upsertUser,
 } from "./db.js";
+
+function sha256Hex(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
+}
 import type {
   Aggregates,
   Ask,
@@ -36,27 +46,44 @@ export type AnalyzeOptions = {
   model?: string;
   embeddingModel?: string;
   concurrency?: number;
+  // When false (default), sessions that already have an analyzed
+  // SessionMeta in `insights_sessions` skip the LLM extraction step:
+  // their cached facets are reconstructed from storage. Set true to
+  // force re-extraction across the board.
+  force?: boolean;
   onProgress?: (p: AnalyzeProgress) => void;
 };
 
 // ---------- pricing ----------
-const PRICING: Record<
-  string,
-  { input: number; output: number; cacheRead: number; cacheCreate: number }
-> = {
-  "claude-opus-4-7":   { input: 15, output: 75, cacheRead: 1.5, cacheCreate: 18.75 },
-  "claude-sonnet-4-6": { input: 3,  output: 15, cacheRead: 0.3, cacheCreate: 3.75  },
-  "claude-haiku-4-5":  { input: 1,  output: 5,  cacheRead: 0.1, cacheCreate: 1.25  },
-  "claude-opus-4":     { input: 15, output: 75, cacheRead: 1.5, cacheCreate: 18.75 },
-  "claude-sonnet-4":   { input: 3,  output: 15, cacheRead: 0.3, cacheCreate: 3.75  },
-};
-const DEFAULT_PRICE = { input: 5, output: 15, cacheRead: 0.5, cacheCreate: 6 };
+// Pricing comes from the shared catalog (models.dev, refreshed on startup).
+// Fallback rates only kick in when the catalog has no entry for the model —
+// they're rough averages, deliberately on the high side so cost is never
+// silently zero for an unknown model.
+import { getMeta } from "../catalog.js";
 
-function priceFor(model: string) {
-  for (const k of Object.keys(PRICING)) {
-    if (model.startsWith(k)) return PRICING[k]!;
-  }
-  return DEFAULT_PRICE;
+const FALLBACK_PRICE = {
+  input: 5,
+  output: 15,
+  cacheRead: 0.5,
+  cacheWrite: 6,
+};
+
+type Price = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+};
+
+function priceFor(model: string): Price {
+  const meta = getMeta(model);
+  if (!meta || (meta.input === 0 && meta.output === 0)) return FALLBACK_PRICE;
+  return {
+    input: meta.input,
+    output: meta.output,
+    cacheRead: meta.cacheRead,
+    cacheWrite: meta.cacheWrite,
+  };
 }
 
 function turnCost(
@@ -74,7 +101,7 @@ function turnCost(
   const cr = usage.cache_read_input_tokens ?? 0;
   const cc = usage.cache_creation_input_tokens ?? 0;
   return (
-    (i * p.input + o * p.output + cr * p.cacheRead + cc * p.cacheCreate) / 1e6
+    (i * p.input + o * p.output + cr * p.cacheRead + cc * p.cacheWrite) / 1e6
   );
 }
 
@@ -320,6 +347,8 @@ type RequestRow = {
   finished_at: number | null;
   input_tokens: number | null;
   output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
   cost: number | null;
   request_json: string;
   response_json: string | null;
@@ -333,7 +362,8 @@ function parseSessionFromDb(sessionId: string): RawParse | null {
   const requests = db
     .prepare(
       `SELECT id, session_id, user_id, provider, model, status, error,
-              started_at, finished_at, input_tokens, output_tokens, cost,
+              started_at, finished_at,
+              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost,
               request_json, response_json
        FROM requests WHERE session_id = ? ORDER BY started_at ASC`,
     )
@@ -520,14 +550,33 @@ function parseSessionFromDb(sessionId: string): RawParse | null {
       const model = r.model || "unknown";
       models[model] = (models[model] ?? 0) + 1;
 
-      // Best-effort usage extraction. Anthropic puts it on resp.usage; OpenAI
-      // shape uses resp.usage with prompt_tokens/completion_tokens.
+      // Prefer the request row's columns (single source of truth, written at
+      // ingest time) and fall back to the response JSON only when a column is
+      // missing — that handles legacy rows seeded before the cache columns
+      // existed. Anthropic uses resp.usage.{input,output,cache_*}_tokens;
+      // OpenAI uses resp.usage.{prompt,completion}_tokens with cached split
+      // under prompt_tokens_details.cached_tokens.
       const respUsage = (resp && typeof resp === "object" && (resp as any).usage) || {};
+      const oaiCached = respUsage.prompt_tokens_details?.cached_tokens ?? 0;
+      const oaiPrompt = respUsage.prompt_tokens ?? 0;
       const usage = {
-        input_tokens: respUsage.input_tokens ?? respUsage.prompt_tokens ?? r.input_tokens ?? 0,
-        output_tokens: respUsage.output_tokens ?? respUsage.completion_tokens ?? r.output_tokens ?? 0,
-        cache_read_input_tokens: respUsage.cache_read_input_tokens ?? 0,
-        cache_creation_input_tokens: respUsage.cache_creation_input_tokens ?? 0,
+        input_tokens:
+          r.input_tokens ??
+          respUsage.input_tokens ??
+          Math.max(0, oaiPrompt - oaiCached),
+        output_tokens:
+          r.output_tokens ??
+          respUsage.output_tokens ??
+          respUsage.completion_tokens ??
+          0,
+        cache_read_input_tokens:
+          r.cache_read_tokens ??
+          respUsage.cache_read_input_tokens ??
+          oaiCached,
+        cache_creation_input_tokens:
+          r.cache_creation_tokens ??
+          respUsage.cache_creation_input_tokens ??
+          0,
       };
       tokens.input += usage.input_tokens;
       tokens.output += usage.output_tokens;
@@ -812,6 +861,39 @@ async function extractFacets(
   const cacheKey = `${raw.sessionId}|${raw.endedAt}`;
   const cached = extractCache.get(cacheKey);
   if (cached) return cached;
+  // Persisted-cache short-circuit: if this session already has an analyzed
+  // SessionMeta in storage and the caller didn't set force=true, reconstruct
+  // the Extracted shape from it and skip the LLM call. This is what makes
+  // re-analyze cheap: only newly-seeded sessions hit the model.
+  if (!opts.force) {
+    const stored = getSession(raw.sessionId);
+    if (stored) {
+      const reconstructed: Extracted = {
+        goal: stored.goal,
+        outcome: stored.outcome,
+        session_type: stored.sessionType,
+        friction: stored.friction.filter((f): f is (typeof FRICTION_VOCAB)[number] =>
+          (FRICTION_VOCAB as readonly string[]).includes(f),
+        ),
+        primary_success: stored.primarySuccess,
+        brief_summary: stored.briefSummary,
+        asks: stored.asks.map((a) => ({
+          intent: a.intent,
+          artifact: a.artifact,
+          text: a.text,
+        })),
+        unresolved: stored.unresolved.map((u) => ({
+          topic: u.topic,
+          framing: u.framing,
+        })),
+        // task_hardness isn't persisted on SessionMeta; medium is a safe
+        // neutral fallback (only used for wrong_model waste detection).
+        task_hardness: 3,
+      };
+      extractCache.set(cacheKey, reconstructed);
+      return reconstructed;
+    }
+  }
   if (!llmAvailable) {
     const f = extractFallback(raw);
     extractCache.set(cacheKey, f);
@@ -879,25 +961,74 @@ async function embedTexts(
   const provider = makeProvider(opts);
   const embedder =
     provider && opts.embeddingModel ? provider.textEmbeddingModel(opts.embeddingModel) : null;
+  // No real embedder configured — `stubEmbed` is deterministic from the text,
+  // so caching it would just waste DB rows. Compute on the fly.
   if (!embedder) return texts.map((t) => stubEmbed(t));
-  const out: number[][] = [];
+
+  const modelKey = opts.embeddingModel ?? "default";
+  const out: (number[] | null)[] = new Array<number[] | null>(texts.length).fill(null);
+  const hashes = texts.map((t) => sha256Hex(t));
+
+  // Phase 1: serve everything we can from disk. Identical text + model →
+  // identical vector, so a re-analyze pass with no new transcripts pays
+  // O(N hash + lookups) instead of O(N API calls).
+  const missIndices: number[] = [];
+  for (let i = 0; i < texts.length; i++) {
+    const cached = getCachedEmbedding(hashes[i]!, modelKey);
+    if (cached) out[i] = cached;
+    else missIndices.push(i);
+  }
+
+  if (missIndices.length === 0) {
+    return out as number[][];
+  }
+
+  // Phase 2: embed the misses in batches, then persist them so the next run
+  // hits the cache. Within one call, dedupe identical missing texts so we
+  // don't pay twice for the same string in the same batch.
+  const uniqueMisses = new Map<string, { text: string; indices: number[] }>();
+  for (const i of missIndices) {
+    const h = hashes[i]!;
+    const e = uniqueMisses.get(h);
+    if (e) e.indices.push(i);
+    else uniqueMisses.set(h, { text: texts[i]!, indices: [i] });
+  }
+  const uniqueEntries = Array.from(uniqueMisses.entries());
   const batchSize = 32;
   let useStub = false;
-  for (let i = 0; i < texts.length; i += batchSize) {
-    const batch = texts.slice(i, i + batchSize);
+  const persistRows: Array<{ textHash: string; model: string; vector: number[] }> = [];
+  for (let i = 0; i < uniqueEntries.length; i += batchSize) {
+    const batch = uniqueEntries.slice(i, i + batchSize);
+    const batchTexts = batch.map(([, v]) => v.text);
     if (useStub) {
-      for (const t of batch) out.push(stubEmbed(t));
+      for (let k = 0; k < batch.length; k++) {
+        const v = stubEmbed(batchTexts[k]!);
+        for (const idx of batch[k]![1].indices) out[idx] = v;
+      }
       continue;
     }
     try {
-      const { embeddings } = await embedMany({ model: embedder, values: batch });
-      for (const v of embeddings) out.push(v as number[]);
+      const { embeddings } = await embedMany({ model: embedder, values: batchTexts });
+      for (let k = 0; k < embeddings.length; k++) {
+        const vec = embeddings[k] as number[];
+        const [hash, info] = batch[k]!;
+        for (const idx of info.indices) out[idx] = vec;
+        persistRows.push({ textHash: hash, model: modelKey, vector: vec });
+      }
     } catch {
+      // Fall back to deterministic stub for the rest of the run; don't cache
+      // stub vectors since they're free to recompute and we don't want them
+      // to poison the persistent cache for the real model.
       useStub = true;
-      for (const t of batch) out.push(stubEmbed(t));
+      for (let k = 0; k < batch.length; k++) {
+        const v = stubEmbed(batchTexts[k]!);
+        for (const idx of batch[k]![1].indices) out[idx] = v;
+      }
     }
   }
-  return out;
+
+  if (persistRows.length > 0) putCachedEmbeddings(persistRows);
+  return out as number[][];
 }
 
 // ---------- clustering ----------
@@ -1319,7 +1450,7 @@ async function runPipeline(
         0,
       );
     if (ex.task_hardness <= 2 && opusCost > 0) {
-      const hp = PRICING["claude-haiku-4-5"]!;
+      const hp = priceFor("claude-haiku-4-5");
       let haikuEquivCost = 0;
       for (const m of r.modelTurnCosts) {
         if (m.model.includes("opus")) {
@@ -1328,7 +1459,7 @@ async function runPipeline(
             ((u.input_tokens ?? 0) * hp.input +
               (u.output_tokens ?? 0) * hp.output +
               (u.cache_read_input_tokens ?? 0) * hp.cacheRead +
-              (u.cache_creation_input_tokens ?? 0) * hp.cacheCreate) /
+              (u.cache_creation_input_tokens ?? 0) * hp.cacheWrite) /
             1e6;
         }
       }
@@ -1669,9 +1800,29 @@ async function labelCluster(
     "ops",
     "other",
   ];
+  const safeDomainOf = (raw: string): Cluster["domain"] => {
+    const dom = raw.toLowerCase();
+    return (allowedDomains as string[]).includes(dom)
+      ? (dom as Cluster["domain"])
+      : "other";
+  };
   if (!llmAvailable || samples.length === 0) {
     return { label: cluster.label || "Untitled", domain: "other" };
   }
+
+  // Content-addressed: identical sample bag (in canonical order, capped at 8)
+  // produces the same label + domain on the configured model. Re-analyzing a
+  // stable corpus reuses every label without a single LLM call.
+  const canonicalSamples = samples.slice(0, 8);
+  const samplesHash = sha256Hex(
+    JSON.stringify([...canonicalSamples].sort()),
+  );
+  const modelKey = opts.model ?? "default";
+  const cached = getCachedClusterLabel(samplesHash, modelKey);
+  if (cached) {
+    return { label: cached.label, domain: safeDomainOf(cached.domain) };
+  }
+
   try {
     const object = await chatJSON(
       opts,
@@ -1680,15 +1831,14 @@ async function labelCluster(
 - domain: one of strategy|code|research|writing|data|ops|other.
 
 Samples:
-${samples.slice(0, 8).map((s, i) => `${i + 1}. ${s}`).join("\n")}`,
+${canonicalSamples.map((s, i) => `${i + 1}. ${s}`).join("\n")}`,
       z.object({ label: z.string(), domain: z.string() }),
       { maxTokens: 200 },
     );
-    const dom = (object.domain ?? "other").toLowerCase();
-    const safeDomain = (allowedDomains as string[]).includes(dom)
-      ? (dom as Cluster["domain"])
-      : "other";
-    return { label: object.label || "Untitled", domain: safeDomain };
+    const label = object.label || "Untitled";
+    const domain = safeDomainOf(object.domain ?? "other");
+    putCachedClusterLabel(samplesHash, modelKey, label, domain);
+    return { label, domain };
   } catch {
     return { label: cluster.label || "Untitled", domain: "other" };
   }

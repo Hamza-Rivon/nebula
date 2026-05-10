@@ -6,13 +6,16 @@ import {
   getSession,
   getTranscript,
   clearInsights,
+  resolveInsightsUserId,
+  listSessionsForUser,
+  listSessionsByFriction,
 } from "./db.js";
-import { enqueueJob, getJob, listJobs } from "./jobs.js";
+import { cancelJob, deleteJob, enqueueJob, getJob, listJobs } from "./jobs.js";
 
 export const insightsApi = new Hono();
 
 insightsApi.post("/analyze", async (c) => {
-  let body: { all?: boolean; sessionId?: string } = {};
+  let body: { all?: boolean; sessionId?: string; force?: boolean } = {};
   try {
     body = (await c.req.json()) as typeof body;
   } catch {
@@ -26,7 +29,10 @@ insightsApi.post("/analyze", async (c) => {
       400,
     );
   }
-  const scope = wantsAll ? "all" : `session:${sid}`;
+  const force = body.force === true;
+  const base = wantsAll ? "all" : `session:${sid}`;
+  // Encode the force bit in the scope string so jobs.ts can read it back.
+  const scope = force ? `${base}+force` : base;
   const job = enqueueJob(scope);
   return c.json(job);
 });
@@ -39,6 +45,25 @@ insightsApi.get("/jobs/:id", (c) => {
 
 insightsApi.get("/jobs", (c) => {
   return c.json({ jobs: listJobs(20) });
+});
+
+// Cancel a queued or running job. Idempotent against terminal rows: hitting
+// this on an already-done job just returns its current state.
+insightsApi.post("/jobs/:id/cancel", (c) => {
+  const job = cancelJob(c.req.param("id"));
+  if (!job) return c.json({ error: "not_found" }, 404);
+  return c.json(job);
+});
+
+// Delete a job row outright. Refuses while running — the caller should cancel
+// first and let the runner write a terminal status before pruning the row.
+insightsApi.delete("/jobs/:id", (c) => {
+  const result = deleteJob(c.req.param("id"));
+  if (!result.ok) {
+    const status = result.reason === "not_found" ? 404 : 409;
+    return c.json({ error: result.reason }, status);
+  }
+  return c.json({ ok: true });
 });
 
 insightsApi.get("/insights", (c) => {
@@ -78,4 +103,25 @@ insightsApi.get("/insights/sessions/:sessionId", (c) => {
 insightsApi.delete("/insights", (c) => {
   clearInsights();
   return c.json({ ok: true });
+});
+
+// Filter analyzed sessions by friction tag (and optionally by user). Used by
+// the click-through from the Insights drawer's friction chips.
+insightsApi.get("/insights/sessions", (c) => {
+  const friction = c.req.query("friction")?.trim();
+  const userParam = c.req.query("user")?.trim();
+  const limit = Math.min(Number(c.req.query("limit") ?? 50), 200);
+  const offset = Number(c.req.query("offset") ?? 0);
+  if (userParam) {
+    const uid = resolveInsightsUserId(userParam);
+    if (!uid) return c.json({ sessions: [], total: 0 });
+    return c.json(listSessionsForUser(uid, { friction, limit, offset }));
+  }
+  if (!friction) {
+    return c.json(
+      { error: "missing_param", hint: "provide ?friction=<tag> or ?user=<id>" },
+      400,
+    );
+  }
+  return c.json(listSessionsByFriction(friction, { limit, offset }));
 });

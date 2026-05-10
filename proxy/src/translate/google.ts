@@ -149,6 +149,8 @@ export function googleStreamToOAI(
     tool_calls: any[];
     input_tokens: number;
     output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
     finish_reason: string;
   }) => void,
 ): ReadableStream<Uint8Array> {
@@ -161,6 +163,7 @@ export function googleStreamToOAI(
   const toolCalls: any[] = [];
   let inputTokens = 0;
   let outputTokens = 0;
+  let cacheReadTokens = 0;
   let stop = "stop";
 
   function chunk(delta: any, finish?: string): Uint8Array {
@@ -240,7 +243,13 @@ export function googleStreamToOAI(
                     ? "length"
                     : "stop";
             if (evt.usageMetadata) {
-              inputTokens = evt.usageMetadata.promptTokenCount ?? inputTokens;
+              // Google's cachedContentTokenCount is a subset of promptTokenCount
+              // (the cached portion). Split it out so totals stay correct.
+              const cached = evt.usageMetadata.cachedContentTokenCount ?? 0;
+              const promptTotal =
+                evt.usageMetadata.promptTokenCount ?? inputTokens + cacheReadTokens;
+              cacheReadTokens = cached;
+              inputTokens = Math.max(0, promptTotal - cached);
               outputTokens =
                 evt.usageMetadata.candidatesTokenCount ?? outputTokens;
             }
@@ -255,6 +264,8 @@ export function googleStreamToOAI(
           tool_calls: toolCalls,
           input_tokens: inputTokens,
           output_tokens: outputTokens,
+          cache_read_tokens: cacheReadTokens,
+          cache_creation_tokens: 0,
           finish_reason: stop,
         });
       }

@@ -3,15 +3,29 @@ async function j<T>(r: Response): Promise<T> {
   return r.json();
 }
 
+// Token convention used everywhere in the UI:
+//   input_tokens  = fresh (uncached) input tokens
+//   output_tokens = generated tokens
+//   cache_*_tokens = cached prefix re-read / written; reported separately so
+//                    "total tokens" (input+output) matches Claude Code /status
 export type Stats = {
   request_count: number;
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
   cost: number;
   avg_latency_ms: number;
   error_count: number | null;
   session_count: number;
-  byModel: { model: string; n: number; cost: number; tokens: number }[];
+  byModel: {
+    model: string;
+    n: number;
+    cost: number;
+    tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+  }[];
   byProvider: { provider: string; n: number; cost: number }[];
   recent: { hour: string; n: number; cost: number }[];
 };
@@ -24,6 +38,8 @@ export type SessionRow = {
   request_count: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cache_read_tokens: number;
+  total_cache_creation_tokens: number;
   total_cost: number;
 };
 
@@ -41,11 +57,12 @@ export type RequestRow = {
   latency_ms: number | null;
   input_tokens: number | null;
   output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
   cost: number | null;
   finish_reason: string | null;
 };
 
-// Loose payload types - request/response JSON shapes vary by provider
 export type JsonValue =
   | string
   | number
@@ -66,7 +83,13 @@ export type RequestDetail = RequestRow & {
   tool_calls: ToolCall[] | null;
 };
 
-export type Provider = { id: string; configured: boolean; base_url: string };
+export type Provider = {
+  id: string;
+  kind: "openai" | "anthropic" | "google";
+  base_url: string;
+  configured: boolean;
+  catalog_key: string | null;
+};
 
 export type TimeseriesBucket = "minute" | "hour" | "day";
 export type TimeseriesPoint = {
@@ -75,6 +98,8 @@ export type TimeseriesPoint = {
   cost: number;
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
   avg_latency_ms: number;
   errors: number;
 };
@@ -104,10 +129,10 @@ export type ToolUsage = {
   avg_latency_ms: number;
   cost: number;
   error_rate: number;
-  top_model: string;
-  sample_args: string | null;
+  top_model: string | null;
+  sample_args: string[] | null;
 };
-export type ToolsResp = { tools: ToolUsage[] };
+export type ToolsResp = { tools: ToolUsage[]; total: number };
 
 export type UserUsage = {
   user_id: string;
@@ -115,44 +140,138 @@ export type UserUsage = {
   session_count: number;
   cost: number;
   tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
   avg_latency_ms: number;
   errors: number;
   last_seen: number;
 };
-export type UsersResp = { users: UserUsage[] };
+export type UsersResp = { users: UserUsage[]; total: number };
 
 export type SearchResp = { requests: RequestRow[]; q: string };
 
+export type SessionsAggregates = {
+  count: number;
+  total_cost: number;
+  total_tokens: number;
+  total_cache_read_tokens: number;
+  total_cache_creation_tokens: number;
+  avg_requests_per_session: number;
+  top_model: string | null;
+};
+
+export type RequestsAggregates = {
+  count: number;
+  total_cost: number;
+  avg_latency_ms: number;
+  p95_latency_ms: number;
+  error_count: number;
+  error_rate: number;
+};
+
+export type UsersAggregates = {
+  active: number;
+  total_cost: number;
+  total_tokens: number;
+  total_cache_read_tokens: number;
+  total_cache_creation_tokens: number;
+  top_user_id: string | null;
+  top_user_cost: number;
+};
+
+export type ToolsAggregates = {
+  count: number;
+  total_calls: number;
+  total_cost: number;
+  error_rate: number;
+};
+
+// Insights types — re-exported via the insights module too. We type just
+// enough for the join endpoints; full SessionMeta lives in insights/types.
+export type InsightsSessionStub = import("./insights/types").SessionMeta;
+export type InsightsUser = import("./insights/types").User;
+export type InsightsSessionsResp = {
+  sessions: InsightsSessionStub[];
+  total: number;
+};
+export type UserInsightsBundle = {
+  user: InsightsUser | null;
+  sessions: InsightsSessionStub[];
+  total: number;
+};
+export type SessionInsights = { session: InsightsSessionStub | null };
+
+// Common shape for paginated query parameters that most list endpoints accept.
+export type ListQuery = {
+  limit?: number;
+  offset?: number;
+  q?: string;
+  user?: string;
+  since?: number;
+  until?: number;
+};
+
+function qs(params: Record<string, string | number | boolean | undefined>): string {
+  const u = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v == null || v === "" || v === false) continue;
+    u.set(k, String(v));
+  }
+  const s = u.toString();
+  return s ? `?${s}` : "";
+}
+
 export const api = {
   stats: () => fetch("/api/stats").then(j<Stats>),
-  sessions: (limit = 50, offset = 0) =>
-    fetch(`/api/sessions?limit=${limit}&offset=${offset}`).then(
-      j<{ sessions: SessionRow[]; total: number }>,
-    ),
+
+  sessions: (q: ListQuery = {}) =>
+    fetch(`/api/sessions${qs(q)}`).then(j<{ sessions: SessionRow[]; total: number }>),
+  sessionsAggregates: (q: ListQuery = {}) =>
+    fetch(`/api/sessions/aggregates${qs(q)}`).then(j<SessionsAggregates>),
   session: (id: string) =>
     fetch(`/api/sessions/${encodeURIComponent(id)}`).then(
       j<{ session: SessionRow; requests: RequestRow[] }>,
     ),
-  requests: (q: { limit?: number; offset?: number; model?: string; status?: string; session?: string } = {}) => {
-    const p = new URLSearchParams();
-    if (q.limit) p.set("limit", String(q.limit));
-    if (q.offset) p.set("offset", String(q.offset));
-    if (q.model) p.set("model", q.model);
-    if (q.status) p.set("status", q.status);
-    if (q.session) p.set("session", q.session);
-    return fetch(`/api/requests?${p}`).then(j<{ requests: RequestRow[]; total: number }>);
-  },
+  sessionInsights: (id: string) =>
+    fetch(`/api/sessions/${encodeURIComponent(id)}/insights`).then(j<SessionInsights>),
+
+  requests: (
+    q: ListQuery & { model?: string; status?: string; session?: string } = {},
+  ) =>
+    fetch(`/api/requests${qs(q)}`).then(j<{ requests: RequestRow[]; total: number }>),
+  requestsAggregates: (
+    q: ListQuery & { model?: string; status?: string; session?: string } = {},
+  ) => fetch(`/api/requests/aggregates${qs(q)}`).then(j<RequestsAggregates>),
   request: (id: string) =>
     fetch(`/api/requests/${encodeURIComponent(id)}`).then(j<RequestDetail>),
+
+  users: (q: { limit?: number; offset?: number; q?: string; friction?: string } = {}) =>
+    fetch(`/api/users${qs(q)}`).then(j<UsersResp>),
+  usersAggregates: () => fetch(`/api/users/aggregates`).then(j<UsersAggregates>),
+  userInsights: (
+    idOrRaw: string,
+    q: { friction?: string; limit?: number; offset?: number } = {},
+  ) =>
+    fetch(`/api/users/${encodeURIComponent(idOrRaw)}/insights${qs(q)}`).then(
+      j<UserInsightsBundle>,
+    ),
+
+  tools: (q: { limit?: number; offset?: number; q?: string; errorsOnly?: boolean } = {}) =>
+    fetch(`/api/tools${qs({ ...q, errorsOnly: q.errorsOnly ? 1 : undefined })}`).then(
+      j<ToolsResp>,
+    ),
+  toolsAggregates: () => fetch(`/api/tools/aggregates`).then(j<ToolsAggregates>),
+
   providers: () => fetch("/api/providers").then(j<{ providers: Provider[] }>),
 
   timeseries: (bucket: TimeseriesBucket = "hour", hours = 24) =>
     fetch(`/api/timeseries?bucket=${bucket}&hours=${hours}`).then(j<TimeseriesResp>),
-  heatmap: (days = 7) =>
-    fetch(`/api/heatmap?days=${days}`).then(j<HeatmapResp>),
+  heatmap: (days = 7) => fetch(`/api/heatmap?days=${days}`).then(j<HeatmapResp>),
   latency: () => fetch("/api/latency").then(j<LatencyResp>),
-  tools: () => fetch("/api/tools").then(j<ToolsResp>),
-  users: () => fetch("/api/users").then(j<UsersResp>),
   search: (q: string) =>
     fetch(`/api/search?q=${encodeURIComponent(q)}`).then(j<SearchResp>),
+
+  insightsSessionsByFilter: (
+    q: { friction?: string; user?: string; limit?: number; offset?: number },
+  ) => fetch(`/api/insights/sessions${qs(q)}`).then(j<InsightsSessionsResp>),
 };

@@ -1,9 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, type RequestDetail, type RequestRow, type SessionRow } from "../api";
+import { useQueries, useQuery } from "@tanstack/react-query";
+import { api, type RequestDetail, type RequestRow } from "../api";
 import { ConversationView, extractEvents, type ConvEvent } from "../components/ConversationView";
 import { EmptyState } from "../components/EmptyState";
 import { fmt } from "../format";
+import { requestDetailQuery, sessionDetailQuery } from "../queries";
+import { useFreshIds } from "../liveBridge";
+import type { LiveEvent } from "../liveEvents";
 
 type View = "table" | "timeline" | "flow";
 
@@ -11,6 +15,7 @@ const PROVIDER_COLOR: Record<string, string> = {
   anthropic: "var(--color-mint)",
   openai: "var(--color-butter)",
   kimi: "var(--color-peach)",
+  "openai-compatible": "var(--color-lime)",
   google: "var(--color-lavender)",
   groq: "var(--color-sky)",
   mistral: "var(--color-rose)",
@@ -23,70 +28,35 @@ function providerColor(p: string): string {
 
 export function SessionDetailPage() {
   const { id = "" } = useParams();
-  const [data, setData] = useState<{ session: SessionRow; requests: RequestRow[] } | null>(null);
   const [view, setView] = useState<View>("flow");
-  const [err, setErr] = useState<string | null>(null);
-  const seen = useRef<Set<string>>(new Set());
-  const [newIds, setNewIds] = useState<Set<string>>(new Set());
-  const [details, setDetails] = useState<Record<string, RequestDetail>>({});
 
-  useEffect(() => {
-    let alive = true;
-    const tick = () =>
-      api
-        .session(id)
-        .then((d) => {
-          if (!alive) return;
-          if (seen.current.size > 0) {
-            const fresh = new Set<string>();
-            for (const r of d.requests) {
-              if (!seen.current.has(r.id)) fresh.add(r.id);
-            }
-            if (fresh.size) {
-              setNewIds(fresh);
-              setTimeout(() => alive && setNewIds(new Set()), 700);
-            }
-          }
-          seen.current = new Set(d.requests.map((x) => x.id));
-          setData(d);
-        })
-        .catch((e) => alive && setErr(String(e)));
-    tick();
-    const t = setInterval(tick, 4000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, [id]);
+  const sessionQuery = useQuery(sessionDetailQuery(id));
+  const data = sessionQuery.data ?? null;
+  const err = sessionQuery.error ? String(sessionQuery.error) : null;
 
-  // Lazy-fetch details for all requests in the session (capped at 30) so we can
-  // power the Gantt stats line and the Flow view. Cached by id.
-  useEffect(() => {
-    if (!data) return;
-    let alive = true;
-    const need = data.requests.slice(0, 30).filter((r) => !details[r.id]);
-    Promise.all(
-      need.map((r) =>
-        api
-          .request(r.id)
-          .then((d) => [r.id, d] as const)
-          .catch(() => null),
-      ),
-    ).then((results) => {
-      if (!alive) return;
-      setDetails((m) => {
-        const next = { ...m };
-        for (const r of results) {
-          if (r) next[r[0]] = r[1];
-        }
-        return next;
-      });
+  // Flash newly-arrived requests on this session. Driven by the SSE bus —
+  // pure client work, no extra HTTP traffic.
+  const newIds = useFreshIds((e: LiveEvent) =>
+    e.type === "request" && e.session_id === id ? e.request_id : null,
+  );
+
+  // Lazy-fetch details for the first 30 requests in parallel; results land in
+  // the cache so navigating to /requests/:id is instant.
+  const slice: RequestRow[] = useMemo(
+    () => data?.requests.slice(0, 30) ?? [],
+    [data?.requests],
+  );
+  const detailQueries = useQueries({
+    queries: slice.map((r) => requestDetailQuery(r.id)),
+  });
+  const details: Record<string, RequestDetail> = useMemo(() => {
+    const out: Record<string, RequestDetail> = {};
+    detailQueries.forEach((q, i) => {
+      const r = slice[i];
+      if (q.data && r) out[r.id] = q.data;
     });
-    return () => {
-      alive = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data?.requests.map((r) => r.id).join(",")]);
+    return out;
+  }, [detailQueries, slice]);
 
   if (err) return <div className="nb-card p-5" style={{ background: "var(--color-rose)" }}>{err}</div>;
   if (!data) return <div className="nb-card p-5">Loading…</div>;
@@ -147,6 +117,8 @@ export function SessionDetailPage() {
           <div className="text-sm font-bold">{fmt.date(s.created_at)}</div>
         </div>
       </div>
+
+      <InsightsBanner sessionId={s.id} />
 
       <GanttStats requests={data.requests} details={details} />
 
@@ -931,3 +903,77 @@ function FlowDivider({ r, idx }: { r: RequestRow; idx: number }) {
     </Link>
   );
 }
+
+
+// =============================================================================
+// Insights banner — joins the manager-grade SessionMeta when present so the
+// engineer view shows the goal, outcome, and any flagged frictions/waste.
+// Renders nothing when no analyze pass has covered this session.
+// =============================================================================
+
+function InsightsBanner({ sessionId }: { sessionId: string }) {
+  const query = useQuery({
+    queryKey: ["sessions", "insights", sessionId] as const,
+    queryFn: () => api.sessionInsights(sessionId),
+    enabled: !!sessionId,
+  });
+  const meta = query.data?.session ?? null;
+  if (query.isLoading || !meta) return null;
+  return (
+    <div className="nb-card p-4" style={{ background: "var(--color-mist)" }}>
+      <div className="flex flex-wrap items-baseline gap-2">
+        <span className="text-[10px] font-bold uppercase tracking-widest opacity-60">
+          Manager view
+        </span>
+        <span className="nb-chip" style={{ background: outcomeBg(meta.outcome) }}>
+          {meta.outcome}
+        </span>
+        <span className="nb-chip" style={{ background: "var(--color-lavender)" }}>
+          {meta.sessionType.replace(/_/g, " ")}
+        </span>
+        {meta.wasteUsd > 0 && (
+          <span className="nb-chip" style={{ background: "var(--color-rose)" }}>
+            {fmt.cost(meta.wasteUsd)} flagged waste
+          </span>
+        )}
+      </div>
+      {meta.goal && (
+        <div className="mt-2 text-sm">
+          <span className="opacity-60">Goal · </span>
+          {meta.goal}
+        </div>
+      )}
+      {meta.briefSummary && (
+        <div className="mt-1 text-xs opacity-70 italic">{meta.briefSummary}</div>
+      )}
+      {(meta.friction.length > 0 || meta.wasteFlags.length > 0) && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {meta.friction.map((f) => (
+            <span key={f} className="friction-chip">{f.replace(/_/g, " ")}</span>
+          ))}
+          {meta.wasteFlags.map((w, i) => (
+            <span
+              key={`w${i}`}
+              className="friction-chip"
+              style={{ background: "var(--color-peach)" }}
+              title={w.evidence}
+            >
+              {w.type.replace(/_/g, " ")} · {fmt.cost(w.usdWasted)}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function outcomeBg(o: string): string {
+  switch (o) {
+    case "fully": return "var(--color-mint)";
+    case "mostly": return "var(--color-lime)";
+    case "partial": return "var(--color-butter)";
+    case "none": return "var(--color-rose)";
+    default: return "var(--color-mist)";
+  }
+}
+

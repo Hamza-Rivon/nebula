@@ -5,6 +5,7 @@ import { interpolateRgb } from "d3-interpolate";
 import type { Cluster, Dataset } from "../../insights/types";
 import { affectedUserCount, topUnresolvedCluster } from "../../insights/derive";
 import { truncate } from "../../insights/format";
+import { PALETTE } from "../../insights/palette";
 
 interface Props {
   data: Dataset;
@@ -20,12 +21,14 @@ interface BubblePos {
   color: string;
 }
 
-const COOL = "#2C68C8";
-const WARM = "#B23A1F";
 const PADDING = { top: 36, right: 36, bottom: 36, left: 36 };
-const interpolator = interpolateRgb(COOL, WARM);
 
 export function GapMap({ data, onSelect, selectedId }: Props) {
+  const pal = PALETTE;
+  const interpolator = useMemo(
+    () => interpolateRgb(pal.gapmapLow, pal.gapmapHigh),
+    [pal.gapmapLow, pal.gapmapHigh],
+  );
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState<{ w: number; h: number }>({ w: 800, h: 480 });
   const [hover, setHover] = useState<{
@@ -73,7 +76,7 @@ export function GapMap({ data, onSelect, selectedId }: Props) {
       r: rScale(c.sessionCount),
       color: interpolator(c.severity / sevMax),
     }));
-  }, [data.clusters, size]);
+  }, [data.clusters, size, interpolator]);
 
   const labeledIds = useMemo(() => {
     return [...data.clusters]
@@ -104,7 +107,7 @@ export function GapMap({ data, onSelect, selectedId }: Props) {
             <path
               d="M 40 0 L 0 0 0 40"
               fill="none"
-              stroke="rgba(17,17,17,0.06)"
+              stroke={pal.gridLine}
               strokeWidth="0.5"
             />
           </pattern>

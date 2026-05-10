@@ -152,6 +152,8 @@ export function anthropicStreamToOAI(
     tool_calls: any[];
     input_tokens: number;
     output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
     finish_reason: string;
   }) => void,
 ): ReadableStream<Uint8Array> {
@@ -165,6 +167,8 @@ export function anthropicStreamToOAI(
   const toolUses: Record<number, { id: string; name: string; argsBuf: string }> = {};
   let inputTokens = 0;
   let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreationTokens = 0;
   let stopReason = "stop";
 
   function chunk(delta: any, finish?: string): Uint8Array {
@@ -212,7 +216,10 @@ export function anthropicStreamToOAI(
               continue;
             }
             if (evt.type === "message_start") {
-              inputTokens = evt.message?.usage?.input_tokens ?? 0;
+              const u = evt.message?.usage ?? {};
+              inputTokens = u.input_tokens ?? 0;
+              cacheReadTokens = u.cache_read_input_tokens ?? 0;
+              cacheCreationTokens = u.cache_creation_input_tokens ?? 0;
             } else if (evt.type === "content_block_start") {
               const cb = evt.content_block;
               if (cb?.type === "tool_use") {
@@ -255,8 +262,14 @@ export function anthropicStreamToOAI(
               }
             } else if (evt.type === "message_delta") {
               if (evt.delta?.stop_reason) stopReason = evt.delta.stop_reason;
-              if (evt.usage?.output_tokens)
-                outputTokens = evt.usage.output_tokens;
+              if (evt.usage) {
+                if (evt.usage.output_tokens != null)
+                  outputTokens = evt.usage.output_tokens;
+                if (evt.usage.cache_read_input_tokens != null)
+                  cacheReadTokens = evt.usage.cache_read_input_tokens;
+                if (evt.usage.cache_creation_input_tokens != null)
+                  cacheCreationTokens = evt.usage.cache_creation_input_tokens;
+              }
             } else if (evt.type === "message_stop") {
               // handled in finally
             }
@@ -284,6 +297,8 @@ export function anthropicStreamToOAI(
           tool_calls,
           input_tokens: inputTokens,
           output_tokens: outputTokens,
+          cache_read_tokens: cacheReadTokens,
+          cache_creation_tokens: cacheCreationTokens,
           finish_reason,
         });
       }

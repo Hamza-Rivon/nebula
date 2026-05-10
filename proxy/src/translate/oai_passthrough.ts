@@ -9,6 +9,8 @@ export function teeOAIStream(
     tool_calls: any[];
     input_tokens: number;
     output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
     finish_reason: string;
   }) => void,
 ): ReadableStream<Uint8Array> {
@@ -18,6 +20,7 @@ export function teeOAIStream(
   const toolCalls: Record<number, { id?: string; name?: string; args: string }> = {};
   let inputTokens = 0;
   let outputTokens = 0;
+  let cacheReadTokens = 0;
   let finish = "stop";
 
   return new ReadableStream<Uint8Array>({
@@ -59,7 +62,14 @@ export function teeOAIStream(
               }
               if (choice?.finish_reason) finish = choice.finish_reason;
               if (evt.usage) {
-                inputTokens = evt.usage.prompt_tokens ?? inputTokens;
+                // OpenAI reports cached prompt tokens under
+                // prompt_tokens_details.cached_tokens. They're a *subset* of
+                // prompt_tokens — split them out so we don't double-count.
+                const cached =
+                  evt.usage.prompt_tokens_details?.cached_tokens ?? 0;
+                const promptTotal = evt.usage.prompt_tokens ?? inputTokens;
+                cacheReadTokens = cached;
+                inputTokens = Math.max(0, promptTotal - cached);
                 outputTokens = evt.usage.completion_tokens ?? outputTokens;
               }
             }
@@ -79,6 +89,8 @@ export function teeOAIStream(
           tool_calls: tcArr,
           input_tokens: inputTokens,
           output_tokens: outputTokens,
+          cache_read_tokens: cacheReadTokens,
+          cache_creation_tokens: 0,
           finish_reason: finish,
         });
       }

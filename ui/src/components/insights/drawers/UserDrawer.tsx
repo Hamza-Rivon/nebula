@@ -1,4 +1,4 @@
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import type { Dataset, SessionMeta, User } from "../../../insights/types";
 import { formatDate, formatUsd } from "../../../insights/format";
 import { Avatar } from "../Avatar";
@@ -9,12 +9,23 @@ interface Props {
 }
 
 export function UserDrawer({ user, data }: Props) {
+  const navigate = useNavigate();
   const sessions = data.sessions
     .filter((s) => s.userId === user.id)
     .sort(
       (a, b) =>
         new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
     );
+
+  // Friction tag click → drill into the Users tab pre-filtered to this
+  // engineer with the friction filter applied. Manager sees exactly the
+  // sessions where this person hit that friction.
+  const drillIntoFriction = (friction: string) => {
+    const params = new URLSearchParams();
+    params.set("user", user.id);
+    params.set("friction", friction);
+    navigate(`/users?${params.toString()}`);
+  };
 
   return (
     <div className="space-y-5">
@@ -56,7 +67,25 @@ export function UserDrawer({ user, data }: Props) {
       {Object.keys(user.topFrictions).length > 0 && (
         <div>
           <SectionTitle>Top frictions</SectionTitle>
-          <ChipList map={user.topFrictions} tone="warn" />
+          <div className="flex flex-wrap gap-1.5">
+            {Object.entries(user.topFrictions)
+              .sort((a, b) => b[1] - a[1])
+              .map(([k, v]) => (
+                <button
+                  type="button"
+                  key={k}
+                  className="friction-chip"
+                  onClick={() => drillIntoFriction(k)}
+                  title="see this engineer's sessions with this friction"
+                >
+                  {k.replace(/_/g, " ")}{" "}
+                  <span style={{ opacity: 0.6 }}>· {v}</span>
+                </button>
+              ))}
+          </div>
+          <div className="mt-2 text-[11px] opacity-50">
+            Click a tag to drill into this engineer's matching sessions.
+          </div>
         </div>
       )}
 

@@ -45,7 +45,9 @@ can route Anthropic and Kimi traffic through the same local Docker gateway.
 
 ```bash
 cp .env.example .env
-# add ANTHROPIC_API_KEY and/or KIMI_API_KEY to .env
+# add ANTHROPIC_API_KEY, KIMI_API_KEY, or OPENAI_COMPATIBLE_BASE_URL +
+# OPENAI_COMPATIBLE_API_KEY to .env (for any internal/self-hosted upstream
+# that speaks the OpenAI chat-completions API)
 docker compose up --build
 ```
 
@@ -107,14 +109,36 @@ docker compose up --build
           "limit": { "context": 131072, "output": 8192 }
         }
       }
+    },
+    "nebula-openai-compatible": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Nebula (OpenAI-compatible upstream)",
+      "options": {
+        "baseURL": "http://localhost:8080/v1",
+        "apiKey": "set-in-nebula-env",
+        "headers": {
+          "x-nebula-provider": "openai-compatible",
+          "x-nebula-session": "opencode-openai-compatible",
+          "x-nebula-user": "your-handle"
+        }
+      },
+      "models": {
+        "gpt-oss-20b": {
+          "name": "Internal GPT-OSS 20B via Nebula",
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
     }
   }
 }
 ```
 
-Now OpenCode chats hit Nebula first, then Nebula forwards them to Anthropic or
-Kimi using the provider keys from `.env`. Every turn shows up in the dashboard
-with full payload, tokens, tool calls, latency, and cost.
+Now OpenCode chats hit Nebula first, then Nebula forwards them to Anthropic,
+Kimi, or any OpenAI-compatible endpoint using the credentials from `.env`. Use
+`openai-compatible/<model-id>` (with `OPENAI_COMPATIBLE_BASE_URL` and
+`OPENAI_COMPATIBLE_API_KEY` set) for company-internal or self-hosted upstreams
+— anything that speaks `/v1/chat/completions`. Every turn shows up in the
+dashboard with full payload, tokens, tool calls, latency, and cost.
 
 ## Local dev (no Docker)
 

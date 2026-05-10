@@ -1,31 +1,21 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import {
-  Area,
-  AreaChart,
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Cell,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-import {
-  api,
-  type HeatmapResp,
-  type LatencyResp,
-  type RequestRow,
-  type Stats,
-  type TimeseriesResp,
-} from "../api";
+import { useQuery } from "@tanstack/react-query";
+import { AreaChart } from "../charts/AreaChart";
+import { BarChart } from "../charts/BarChart";
+import { Donut } from "../charts/Donut";
 import { Sparkline } from "../components/Sparkline";
 import { Heatmap } from "../components/Heatmap";
 import { EmptyState } from "../components/EmptyState";
 import { fmt } from "../format";
+import {
+  heatmapQuery,
+  latencyQuery,
+  recentRequestsQuery,
+  statsQuery,
+  timeseriesQuery,
+} from "../queries";
+import { useFreshIds, pickRequestId } from "../liveBridge";
 
 type Metric = "requests" | "cost" | "tokens" | "latency";
 
@@ -46,77 +36,23 @@ const CURL_DEMO = `curl http://localhost:8080/v1/chat/completions \\
        "messages":[{"role":"user","content":"Hello, Nebula!"}]}'`;
 
 export function OverviewPage() {
-  const [stats, setStats] = useState<Stats | null>(null);
-  const [ts, setTs] = useState<TimeseriesResp | null>(null);
-  const [heat, setHeat] = useState<HeatmapResp | null>(null);
-  const [lat, setLat] = useState<LatencyResp | null>(null);
-  const [feed, setFeed] = useState<RequestRow[]>([]);
-  const seenIds = useRef<Set<string>>(new Set());
-  const [newIds, setNewIds] = useState<Set<string>>(new Set());
   const [metric, setMetric] = useState<Metric>("requests");
-  const [err, setErr] = useState<string | null>(null);
 
-  // Stats / charts poll (4s)
-  useEffect(() => {
-    let alive = true;
-    const tick = async () => {
-      try {
-        const [s, t, h, l] = await Promise.all([
-          api.stats(),
-          api.timeseries("hour", 24),
-          api.heatmap(7),
-          api.latency(),
-        ]);
-        if (!alive) return;
-        setStats(s);
-        setTs(t);
-        setHeat(h);
-        setLat(l);
-        setErr(null);
-      } catch (e) {
-        if (alive) setErr(String(e));
-      }
-    };
-    tick();
-    const id = setInterval(tick, 4000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, []);
+  // All four panels share the SSE invalidation pulse, so plain useQuery
+  // suffices — no manual polling.
+  const statsQ = useQuery(statsQuery());
+  const tsQ = useQuery(timeseriesQuery("hour", 24));
+  const heatQ = useQuery(heatmapQuery(7));
+  const latQ = useQuery(latencyQuery());
+  const feedQ = useQuery(recentRequestsQuery(8));
 
-  // Live feed poll (2s)
-  useEffect(() => {
-    let alive = true;
-    const tick = async () => {
-      try {
-        const r = await api.requests({ limit: 8 });
-        if (!alive) return;
-        const incoming = r.requests;
-        // Detect new ids on second+ fetch only
-        if (seenIds.current.size > 0) {
-          const fresh = new Set<string>();
-          for (const row of incoming) {
-            if (!seenIds.current.has(row.id)) fresh.add(row.id);
-          }
-          if (fresh.size) {
-            setNewIds(fresh);
-            setTimeout(() => alive && setNewIds(new Set()), 700);
-          }
-        }
-        seenIds.current = new Set(incoming.map((x) => x.id));
-        setFeed(incoming);
-      } catch {
-        // ignore
-      }
-    };
-    tick();
-    const id = setInterval(tick, 2000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, []);
+  const stats = statsQ.data ?? null;
+  const ts = tsQ.data ?? null;
+  const heat = heatQ.data ?? null;
+  const lat = latQ.data ?? null;
+  const feed = feedQ.data?.requests ?? [];
+  const err = statsQ.error ? String(statsQ.error) : null;
+  const newIds = useFreshIds(pickRequestId);
 
   const sparkSeries = useMemo(() => {
     const pts = ts?.points ?? [];
@@ -188,7 +124,17 @@ export function OverviewPage() {
           label="Tokens"
           value={fmt.num(stats.input_tokens + stats.output_tokens)}
           color="var(--color-lavender)"
-          hint={`${fmt.num(stats.input_tokens)} in · ${fmt.num(stats.output_tokens)} out`}
+          hint={(() => {
+            const cacheRead = stats.cache_read_tokens ?? 0;
+            // Cache hit rate = cache_read / (input + cache_read). Higher is
+            // better — most of the prompt was served from cache, billed at the
+            // discount rate.
+            const denom = stats.input_tokens + cacheRead;
+            const hit = denom > 0 ? Math.round((cacheRead / denom) * 100) : 0;
+            return `${fmt.num(stats.input_tokens)} in · ${fmt.num(stats.output_tokens)} out${
+              cacheRead > 0 ? ` · ${hit}% cached` : ""
+            }`;
+          })()}
           spark={sparkSeries.tokens}
         />
         <StatCard
@@ -236,81 +182,40 @@ export function OverviewPage() {
             />
           ) : (
             <div style={{ height: 280 }}>
-              <ResponsiveContainer width="100%" height="100%">
-                {metric === "tokens" ? (
-                  <AreaChart data={chartData} margin={{ top: 8, right: 12, left: -10, bottom: 0 }}>
-                    <CartesianGrid vertical={false} strokeDasharray="0" />
-                    <XAxis dataKey="t" tickLine={false} />
-                    <YAxis tickLine={false} />
-                    <Tooltip />
-                    <Area
-                      type="monotone"
-                      dataKey="tokensIn"
-                      stackId="1"
-                      stroke="#111"
-                      strokeWidth={3}
-                      fill="var(--color-sky)"
-                      isAnimationActive={false}
-                      name="input"
-                    />
-                    <Area
-                      type="monotone"
-                      dataKey="tokensOut"
-                      stackId="1"
-                      stroke="#111"
-                      strokeWidth={3}
-                      fill="var(--color-mint)"
-                      isAnimationActive={false}
-                      name="output"
-                    />
-                  </AreaChart>
-                ) : metric === "requests" ? (
-                  <AreaChart data={chartData} margin={{ top: 8, right: 12, left: -10, bottom: 0 }}>
-                    <CartesianGrid vertical={false} strokeDasharray="0" />
-                    <XAxis dataKey="t" tickLine={false} />
-                    <YAxis tickLine={false} allowDecimals={false} />
-                    <Tooltip />
-                    <Area
-                      type="monotone"
-                      dataKey="requests"
-                      stroke="#111"
-                      strokeWidth={3}
-                      fill="var(--color-butter)"
-                      isAnimationActive={false}
-                    />
-                  </AreaChart>
-                ) : metric === "cost" ? (
-                  <AreaChart data={chartData} margin={{ top: 8, right: 12, left: -10, bottom: 0 }}>
-                    <CartesianGrid vertical={false} strokeDasharray="0" />
-                    <XAxis dataKey="t" tickLine={false} />
-                    <YAxis tickLine={false} />
-                    <Tooltip />
-                    <Area
-                      type="monotone"
-                      dataKey="cost"
-                      stroke="#111"
-                      strokeWidth={3}
-                      fill="var(--color-peach)"
-                      isAnimationActive={false}
-                    />
-                  </AreaChart>
-                ) : (
-                  <AreaChart data={chartData} margin={{ top: 8, right: 12, left: -10, bottom: 0 }}>
-                    <CartesianGrid vertical={false} strokeDasharray="0" />
-                    <XAxis dataKey="t" tickLine={false} />
-                    <YAxis tickLine={false} />
-                    <Tooltip />
-                    <Area
-                      type="monotone"
-                      dataKey="latency"
-                      stroke="#111"
-                      strokeWidth={3}
-                      fill="var(--color-lavender)"
-                      isAnimationActive={false}
-                    />
-                  </AreaChart>
-                )}
-              </ResponsiveContainer>
+              {metric === "tokens" ? (
+                <AreaChart
+                  data={chartData}
+                  xKey="t"
+                  height={280}
+                  stack
+                  series={[
+                    { key: "tokensIn", fill: "var(--color-sky)", label: "input" },
+                    { key: "tokensOut", fill: "var(--color-mint)", label: "output" },
+                  ]}
+                />
+              ) : metric === "requests" ? (
+                <AreaChart
+                  data={chartData}
+                  xKey="t"
+                  height={280}
+                  yAllowDecimals={false}
+                  series={[{ key: "requests", fill: "var(--color-butter)" }]}
+                />
+              ) : metric === "cost" ? (
+                <AreaChart
+                  data={chartData}
+                  xKey="t"
+                  height={280}
+                  series={[{ key: "cost", fill: "var(--color-peach)" }]}
+                />
+              ) : (
+                <AreaChart
+                  data={chartData}
+                  xKey="t"
+                  height={280}
+                  series={[{ key: "latency", fill: "var(--color-lavender)" }]}
+                />
+              )}
             </div>
           )}
         </div>
@@ -327,25 +232,7 @@ export function OverviewPage() {
           ) : (
             <>
               <div style={{ height: 200 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={modelDonut}
-                      dataKey="value"
-                      nameKey="name"
-                      innerRadius={45}
-                      outerRadius={80}
-                      stroke="#111"
-                      strokeWidth={3}
-                      isAnimationActive={false}
-                    >
-                      {modelDonut.map((d, i) => (
-                        <Cell key={i} fill={d.fill} />
-                      ))}
-                    </Pie>
-                    <Tooltip />
-                  </PieChart>
-                </ResponsiveContainer>
+                <Donut data={modelDonut} height={200} innerRadius={45} outerRadius={80} />
               </div>
               <ul className="mt-2 space-y-1">
                 {modelDonut.map((d, i) => (
@@ -386,22 +273,14 @@ export function OverviewPage() {
                 <Pct label="p99" v={lat.p99} bg="var(--color-rose)" />
               </div>
               <div className="mt-4" style={{ height: 180 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={lat.histogram} margin={{ top: 6, right: 10, left: -16, bottom: 0 }}>
-                    <CartesianGrid vertical={false} strokeDasharray="0" />
-                    <XAxis dataKey="label" tickLine={false} interval={0} />
-                    <YAxis tickLine={false} allowDecimals={false} />
-                    <Tooltip />
-                    <Bar
-                      dataKey="count"
-                      fill="var(--color-lavender)"
-                      stroke="#111"
-                      strokeWidth={2}
-                      radius={2}
-                      isAnimationActive={false}
-                    />
-                  </BarChart>
-                </ResponsiveContainer>
+                <BarChart
+                  data={lat.histogram.map((b) => ({
+                    name: b.label,
+                    count: b.count,
+                    fill: "var(--color-lavender)",
+                  }))}
+                  height={180}
+                />
               </div>
             </>
           )}
