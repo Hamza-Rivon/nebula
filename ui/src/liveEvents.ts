@@ -35,11 +35,24 @@ export type LiveJob = {
 
 export type LiveJobEvent = { type: "job"; job: LiveJob };
 export type LiveJobDeletedEvent = { type: "job_deleted"; id: string };
+// The proxy emits these as session-level analyze tasks complete and as the
+// cross-corpus rollup finishes. The bridge uses them to patch the Insights
+// dataset cache progressively, so users watch sessions land instead of
+// staring at a spinner.
+export type LiveSessionAnalyzedEvent = {
+  type: "session_analyzed";
+  // SessionMeta — typed as `unknown` here so the live-event surface stays
+  // schema-free; the bridge casts to the dashboard's shared shape.
+  session: unknown;
+};
+export type LiveAggregatesUpdatedEvent = { type: "aggregates_updated" };
 
 export type LiveEvent =
   | LiveRequestEvent
   | LiveJobEvent
   | LiveJobDeletedEvent
+  | LiveSessionAnalyzedEvent
+  | LiveAggregatesUpdatedEvent
   | { type: "ping" };
 
 type Handler = (e: LiveEvent) => void;

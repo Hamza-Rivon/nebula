@@ -6,9 +6,10 @@ import { topWasteSessions } from "../../../insights/derive";
 interface Props {
   wasteType: string;
   data: Dataset;
+  anonymized?: boolean;
 }
 
-export function WasteDrawer({ wasteType, data }: Props) {
+export function WasteDrawer({ wasteType, data, anonymized }: Props) {
   const meta = data.aggregates.wasteByType[wasteType] ?? {
     tokens: 0,
     usd: 0,
@@ -48,8 +49,10 @@ export function WasteDrawer({ wasteType, data }: Props) {
                       {truncate(s.goal || s.projectName, 60)}
                     </div>
                     <div className="text-xs opacity-70">
-                      {u?.displayName ?? "—"} ·{" "}
-                      <span className="mono">{s.outcome}</span>
+                      {anonymized
+                        ? (u?.team ?? "—")
+                        : (u?.displayName ?? "—")}{" "}
+                      · <span className="mono">{s.outcome}</span>
                     </div>
                   </div>
                   <div className="text-right">

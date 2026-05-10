@@ -75,6 +75,20 @@ db.exec(`
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (samples_hash, model)
   );
+  -- Per-session extraction cache. The extract phase runs an LLM call per
+  -- session to produce the structured Extracted shape; that's the most
+  -- expensive stage of the pipeline by far. Persisting each result the moment
+  -- it's produced (rather than only at the final pipeline tx) means a
+  -- container kill mid-run doesn't throw away every prior LLM call.
+  -- Keyed on (session_id, ended_at) so a session that gains new requests
+  -- (different ended_at) re-extracts; a stable session reuses the cached row.
+  CREATE TABLE IF NOT EXISTS insights_extracts (
+    session_id TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, ended_at)
+  );
   CREATE INDEX IF NOT EXISTS idx_insights_users_raw ON insights_users(raw_user_id);
   CREATE INDEX IF NOT EXISTS idx_insights_sessions_user ON insights_sessions(user_id);
 `);
@@ -198,20 +212,7 @@ export function getTranscript(sessionId: string): Transcript | null {
 }
 
 export function getDataset(): Dataset | null {
-  const generatedAtRow = getMetaStmt.get("generatedAt") as
-    | { json: string }
-    | undefined;
-  if (!generatedAtRow) return null;
-  const generatedAt = parseRow<string>(generatedAtRow);
-  const config = parseRow<Dataset["config"]>(
-    getMetaStmt.get("config") as { json: string } | undefined,
-  );
-  const aggregates = parseRow<Aggregates>(
-    getMetaStmt.get("aggregates") as { json: string } | undefined,
-  );
-  if (!generatedAt || !config || !aggregates) return null;
-
-  const users = (allUsersStmt.all() as { json: string }[])
+  const usersRaw = (allUsersStmt.all() as { json: string }[])
     .map((r) => parseRow<User>(r))
     .filter((x): x is User => x != null);
   const sessions = (allSessionsStmt.all() as { json: string }[])
@@ -221,6 +222,44 @@ export function getDataset(): Dataset | null {
     .map((r) => parseRow<Cluster>(r))
     .filter((x): x is Cluster => x != null);
 
+  // Nothing analyzed yet — let the API translate to 404 so the UI shows the
+  // "no data" empty state instead of an empty-but-non-null dataset.
+  if (sessions.length === 0) return null;
+
+  // Per-user aggregates. The persisted user rows from `analyzeOneSession`
+  // are minted at zero (sessionCount=0, totalCostUsd=0, …) — the rollup
+  // pass would normally fill them in, but until then the Insights tab
+  // would show every engineer at $0 / 0 sessions / 0% win rate. Recompute
+  // these from `sessions` on every read so the page renders correctly
+  // mid-fanout. Once rollup runs, the recomputed values still match the
+  // persisted ones exactly (same formulas), so this stays correct after
+  // rollup too. Persona / sessionsLast7d / topFrictionLabel are kept from
+  // the persisted row when present (rollup writes them) and otherwise
+  // derived from the live session set.
+  const users = recomputeLiveUserMetrics(usersRaw, sessions);
+
+  const generatedAt =
+    parseRow<string>(getMetaStmt.get("generatedAt") as { json: string } | undefined) ??
+    new Date().toISOString();
+  const config =
+    parseRow<Dataset["config"]>(
+      getMetaStmt.get("config") as { json: string } | undefined,
+    ) ?? {
+      maxSessions: null,
+      users: users.length,
+      model: "",
+      embeddingModel: null,
+      apiBaseUrl: "",
+    };
+  // Aggregates are only finalized at rollup. Until then, derive a minimum
+  // viable view so the Insights page can render counters and per-session
+  // panels live as session tasks complete. The rollup pass overwrites with
+  // the full corpus-wide computation.
+  const aggregates =
+    parseRow<Aggregates>(
+      getMetaStmt.get("aggregates") as { json: string } | undefined,
+    ) ?? deriveProvisionalAggregates(sessions, users);
+
   return {
     generatedAt,
     schemaVersion: 1,
@@ -229,6 +268,165 @@ export function getDataset(): Dataset | null {
     sessions,
     clusters,
     aggregates,
+  };
+}
+
+function recomputeLiveUserMetrics(
+  users: User[],
+  sessions: SessionMeta[],
+): User[] {
+  if (users.length === 0) return users;
+  const byUser = new Map<string, SessionMeta[]>();
+  for (const s of sessions) {
+    const arr = byUser.get(s.userId);
+    if (arr) arr.push(s);
+    else byUser.set(s.userId, [s]);
+  }
+
+  const corpusEnd = sessions.reduce(
+    (acc, s) => (s.endedAt > acc ? s.endedAt : acc),
+    "",
+  );
+  const corpusEndTs = corpusEnd ? new Date(corpusEnd).getTime() : Date.now();
+  const sevenDaysMs = 7 * 86_400_000;
+
+  return users.map((u) => {
+    const userSessions = byUser.get(u.id) ?? [];
+    const totalTokens = userSessions.reduce(
+      (a, s) => a + s.tokens.input + s.tokens.output,
+      0,
+    );
+    const totalCostUsd = userSessions.reduce((a, s) => a + s.costUsd, 0);
+    const totalWasteUsd = userSessions.reduce((a, s) => a + s.wasteUsd, 0);
+    const wizardScore =
+      userSessions.length > 0
+        ? userSessions.reduce((a, s) => a + s.wizardScore, 0) /
+          userSessions.length
+        : 0;
+    const outcomes = { fully: 0, mostly: 0, partial: 0, none: 0, unclear: 0 };
+    const tools: Record<string, number> = {};
+    const fric: Record<string, number> = {};
+    for (const s of userSessions) {
+      outcomes[s.outcome]++;
+      for (const [k, v] of Object.entries(s.tools)) tools[k] = (tools[k] ?? 0) + v;
+      for (const f of s.friction) fric[f] = (fric[f] ?? 0) + 1;
+    }
+    const totalOutcomes =
+      outcomes.fully +
+      outcomes.mostly +
+      outcomes.partial +
+      outcomes.none +
+      outcomes.unclear;
+    const wins = outcomes.fully + outcomes.mostly;
+    const winRate = totalOutcomes > 0 ? wins / totalOutcomes : 0;
+    const costPerWin = wins > 0 ? totalCostUsd / wins : totalCostUsd;
+    const lastActiveAt =
+      userSessions
+        .map((s) => s.startedAt)
+        .sort()
+        .at(-1) ?? new Date(0).toISOString();
+    const sessionsLast7d = userSessions.filter(
+      (s) => corpusEndTs - new Date(s.startedAt).getTime() <= sevenDaysMs,
+    ).length;
+    const topTools = Object.fromEntries(
+      Object.entries(tools)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5),
+    );
+    const topFrictions = Object.fromEntries(
+      Object.entries(fric)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5),
+    );
+    return {
+      ...u,
+      sessionCount: userSessions.length,
+      totalTokens,
+      totalCostUsd,
+      totalWasteUsd,
+      wizardScore,
+      outcomes,
+      topTools,
+      topFrictions,
+      winRate,
+      costPerWin,
+      lastActiveAt,
+      sessionsLast7d,
+      // persona + topFrictionLabel come from rollup when present; otherwise
+      // keep whatever the partial pipeline minted (default "lurker"/"no
+      // recurring friction"). Recomputing those here would duplicate logic
+      // from analyze.ts for marginal benefit.
+    };
+  });
+}
+
+function deriveProvisionalAggregates(
+  sessions: SessionMeta[],
+  users: User[],
+): Aggregates {
+  const allTools: Record<string, number> = {};
+  const modelMix: Record<string, number> = {};
+  const outcomeMix: Record<string, number> = {};
+  const frictionMix: Record<string, number> = {};
+  const wasteByType: Record<
+    string,
+    { tokens: number; usd: number; sessions: number }
+  > = {};
+  let totalTokens = 0;
+  let totalCost = 0;
+  let totalWaste = 0;
+  let dateStart = "";
+  let dateEnd = "";
+  for (const s of sessions) {
+    totalTokens += s.tokens.input + s.tokens.output;
+    totalCost += s.costUsd;
+    totalWaste += s.wasteUsd;
+    if (!dateStart || s.startedAt < dateStart) dateStart = s.startedAt;
+    if (!dateEnd || s.endedAt > dateEnd) dateEnd = s.endedAt;
+    for (const [k, v] of Object.entries(s.tools)) allTools[k] = (allTools[k] ?? 0) + v;
+    for (const [k, v] of Object.entries(s.models)) modelMix[k] = (modelMix[k] ?? 0) + v;
+    outcomeMix[s.outcome] = (outcomeMix[s.outcome] ?? 0) + 1;
+    for (const f of s.friction) frictionMix[f] = (frictionMix[f] ?? 0) + 1;
+    const seenTypes = new Set<string>();
+    for (const w of s.wasteFlags) {
+      if (!wasteByType[w.type])
+        wasteByType[w.type] = { tokens: 0, usd: 0, sessions: 0 };
+      wasteByType[w.type]!.tokens += w.tokensWasted;
+      wasteByType[w.type]!.usd += w.usdWasted;
+      if (!seenTypes.has(w.type)) {
+        wasteByType[w.type]!.sessions += 1;
+        seenTypes.add(w.type);
+      }
+    }
+  }
+  const totalWins = (outcomeMix.fully ?? 0) + (outcomeMix.mostly ?? 0);
+  const allOutcomes =
+    (outcomeMix.fully ?? 0) +
+    (outcomeMix.mostly ?? 0) +
+    (outcomeMix.partial ?? 0) +
+    (outcomeMix.none ?? 0) +
+    (outcomeMix.unclear ?? 0);
+  const adoptionPct =
+    users.length > 0
+      ? users.filter((u) => u.sessionsLast7d >= 2).length / users.length
+      : 0;
+  return {
+    totalSessions: sessions.length,
+    totalUsers: users.length,
+    totalTokens,
+    totalCostUsd: totalCost,
+    totalWasteUsd: totalWaste,
+    productiveUsd: Math.max(0, totalCost - totalWaste),
+    firmWinRate: allOutcomes > 0 ? totalWins / allOutcomes : 0,
+    adoptionPct,
+    costPerLandedOutcome: totalWins > 0 ? totalCost / totalWins : totalCost,
+    prevPeriodCostUsd: null,
+    dateRange: { start: dateStart, end: dateEnd },
+    toolCounts: allTools,
+    modelMix,
+    outcomeMix,
+    frictionMix,
+    wasteByType,
   };
 }
 
@@ -244,6 +442,7 @@ export function clearInsights(): void {
     // see a true rebuild.
     db.exec(`DELETE FROM insights_embeddings`);
     db.exec(`DELETE FROM insights_cluster_labels`);
+    db.exec(`DELETE FROM insights_extracts`);
   });
   tx();
 }
@@ -326,6 +525,37 @@ export function putCachedClusterLabel(
   domain: string,
 ): void {
   upsertClusterLabelStmt.run(samplesHash, model, label, domain, Date.now());
+}
+
+const getExtractStmt = db.prepare(
+  `SELECT json FROM insights_extracts WHERE session_id = ? AND ended_at = ?`,
+);
+const upsertExtractStmt = db.prepare(
+  `INSERT INTO insights_extracts (session_id, ended_at, json, updated_at)
+   VALUES (?, ?, ?, ?)
+   ON CONFLICT(session_id, ended_at) DO UPDATE SET
+     json = excluded.json,
+     updated_at = excluded.updated_at`,
+);
+
+export function getCachedExtract<T>(sessionId: string, endedAt: string): T | null {
+  const row = getExtractStmt.get(sessionId, endedAt) as
+    | { json: string }
+    | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.json) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function putCachedExtract(
+  sessionId: string,
+  endedAt: string,
+  value: unknown,
+): void {
+  upsertExtractStmt.run(sessionId, endedAt, JSON.stringify(value), Date.now());
 }
 
 // Number of captured sessions that have no SessionMeta yet — i.e. work the

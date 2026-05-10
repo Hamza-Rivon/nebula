@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { EmptyState } from "../components/EmptyState";
 import { fmt } from "../format";
-import { jobsListQuery, qk } from "../queries";
+import { jobsInfiniteQuery, jobsListQuery, qk } from "../queries";
+import { useInfiniteScroll } from "../useInfiniteScroll";
 import { insightsApi } from "../insights/api";
 import type { Job } from "../insights/types";
 
@@ -14,8 +20,9 @@ const STATUS_COLOR: Record<Job["status"], string> = {
   cancelled: "var(--color-mist)",
 };
 
-// Re-renders the page once a second while a job is running, so the duration
-// and ETA columns tick down between SSE progress events.
+type ScopeFilter = "all" | "session" | "rollup";
+type StatusFilter = "" | Job["status"];
+
 function useNow(active: boolean, intervalMs = 1000): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -28,21 +35,53 @@ function useNow(active: boolean, intervalMs = 1000): number {
 
 export function JobsPage() {
   const qc = useQueryClient();
-  const query = useQuery(jobsListQuery());
-  const jobs = query.data?.jobs ?? [];
+  const [scope, setScope] = useState<ScopeFilter>("all");
+  const [status, setStatus] = useState<StatusFilter>("");
+
+  const filterParams = useMemo(
+    () => ({
+      scopePrefix:
+        scope === "session" ? "session:" : scope === "rollup" ? "rollup" : undefined,
+      status: status || undefined,
+    }),
+    [scope, status],
+  );
+  // The infinite list drives the actual table. A separate single-row query
+  // keeps the live status count chips fresh — it shares the same backend
+  // /api/jobs endpoint and gets invalidated by the same SSE-driven jobs
+  // root, so counters update in lockstep with the table.
+  const list = useInfiniteQuery(jobsInfiniteQuery(filterParams));
+  const countsQuery = useQuery({
+    ...jobsListQuery({ ...filterParams, limit: 1, offset: 0 }),
+  });
+  const jobs = useMemo(
+    () => list.data?.pages.flatMap((p) => p.jobs) ?? [],
+    [list.data?.pages],
+  );
+  const total = list.data?.pages.at(-1)?.total ?? jobs.length;
+  const counts = (countsQuery.data?.counts ?? list.data?.pages.at(-1)?.counts ?? {
+    queued: 0,
+    running: 0,
+    done: 0,
+    error: 0,
+    cancelled: 0,
+  }) as Record<string, number>;
   const hasRunning = jobs.some((j) => j.status === "running");
   const now = useNow(hasRunning);
 
-  const counts = useMemo(() => {
-    const c = { queued: 0, running: 0, done: 0, error: 0, cancelled: 0 };
-    for (const j of jobs) c[j.status] += 1;
-    return c;
-  }, [jobs]);
+  const sentinelRef = useInfiniteScroll(
+    () => list.fetchNextPage(),
+    !!list.hasNextPage && !list.isFetchingNextPage,
+  );
+
+  // Total tasks in flight across all scopes — what the user thinks of as
+  // "the queue". Driven from server-side counts so it stays correct even when
+  // the page is filtered down to a slice.
+  const queuedOrRunning = (counts.queued ?? 0) + (counts.running ?? 0);
 
   const startAnalyze = useMutation({
     mutationFn: () => insightsApi.postAnalyze({ all: true }),
     onSuccess: () => {
-      // Live SSE will patch the cache, but optimistically refresh too.
       qc.invalidateQueries({ queryKey: qk.jobs.root });
     },
     onError: (e) => alert(`Failed to start analyze: ${String(e)}`),
@@ -52,6 +91,7 @@ export function JobsPage() {
     mutationFn: () => insightsApi.clear(),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.insights.root });
+      qc.invalidateQueries({ queryKey: qk.jobs.root });
     },
     onError: (e) => alert(`Failed to clear insights: ${String(e)}`),
   });
@@ -64,6 +104,11 @@ export function JobsPage() {
           <span className="inline-block h-2 w-2 rounded-full bg-[var(--color-ok)] nb-pulse" />
           live
         </span>
+        {queuedOrRunning > 0 && (
+          <span className="nb-tag" title="tasks queued or running">
+            {fmt.num(queuedOrRunning)} in flight
+          </span>
+        )}
         <div className="ml-auto flex gap-2">
           <button
             type="button"
@@ -71,6 +116,7 @@ export function JobsPage() {
             onClick={() => startAnalyze.mutate()}
             disabled={startAnalyze.isPending}
             style={{ background: "var(--color-butter)" }}
+            title="Fan out a per-session task for every session, then a final rollup"
           >
             {startAnalyze.isPending ? "Queuing…" : "Re-analyze all"}
           </button>
@@ -90,17 +136,47 @@ export function JobsPage() {
       </div>
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <Stat label="Queued" value={counts.queued} bg="var(--color-mist)" />
-        <Stat label="Running" value={counts.running} bg="var(--color-butter)" />
-        <Stat label="Done" value={counts.done} bg="var(--color-mint)" />
-        <Stat label="Errored" value={counts.error} bg="var(--color-rose)" />
+        <Stat label="Queued" value={counts.queued ?? 0} bg="var(--color-mist)" />
+        <Stat label="Running" value={counts.running ?? 0} bg="var(--color-butter)" />
+        <Stat label="Done" value={counts.done ?? 0} bg="var(--color-mint)" />
+        <Stat label="Errored" value={counts.error ?? 0} bg="var(--color-rose)" />
       </div>
 
-      {jobs.length === 0 && !query.isLoading ? (
+      <div className="nb-card flex flex-wrap items-center gap-3 p-3">
+        <span className="text-xs font-bold uppercase tracking-widest opacity-60">
+          Filter
+        </span>
+        <FilterChips<ScopeFilter>
+          value={scope}
+          options={[
+            { value: "all", label: "all" },
+            { value: "session", label: "per-session" },
+            { value: "rollup", label: "rollup" },
+          ]}
+          onChange={setScope}
+        />
+        <span className="text-xs font-bold uppercase tracking-widest opacity-60">
+          Status
+        </span>
+        <FilterChips<StatusFilter>
+          value={status}
+          options={[
+            { value: "", label: "any" },
+            { value: "queued", label: "queued" },
+            { value: "running", label: "running" },
+            { value: "done", label: "done" },
+            { value: "error", label: "error" },
+            { value: "cancelled", label: "cancelled" },
+          ]}
+          onChange={setStatus}
+        />
+      </div>
+
+      {jobs.length === 0 && !list.isLoading ? (
         <div className="nb-card p-5">
           <EmptyState
-            title="No analyze passes have run yet"
-            hint="Click Re-analyze all to score every captured session against the insights pipeline."
+            title="No jobs match the current filter"
+            hint="Click Re-analyze all to fan out a task per session."
             illustration="chart"
           />
         </div>
@@ -109,8 +185,7 @@ export function JobsPage() {
           <table className="nb-table">
             <thead>
               <tr>
-                <th>Job</th>
-                <th>Scope</th>
+                <th>Task</th>
                 <th>Status</th>
                 <th>Stage</th>
                 <th className="text-right">Progress</th>
@@ -126,13 +201,76 @@ export function JobsPage() {
               ))}
             </tbody>
           </table>
+          {/* Sentinel observed by IntersectionObserver — when it scrolls into
+              view we fetchNextPage(). Same pattern as Sessions/Requests. */}
+          <div
+            ref={sentinelRef}
+            className="flex items-center justify-center p-3 text-xs opacity-60"
+          >
+            {list.isFetchingNextPage
+              ? "Loading more…"
+              : list.hasNextPage
+                ? "Scroll for more"
+                : `${fmt.num(jobs.length)} of ${fmt.num(total)} tasks`}
+          </div>
         </div>
       )}
     </div>
   );
 }
 
+function FilterChips<T extends string>({
+  value,
+  options,
+  onChange,
+}: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {options.map((o) => (
+        <button
+          key={o.value || "_"}
+          type="button"
+          className="nb-chip"
+          onClick={() => onChange(o.value)}
+          style={{
+            background:
+              value === o.value ? "var(--color-ink)" : "transparent",
+            color: value === o.value ? "#fff" : "var(--color-ink)",
+            cursor: "pointer",
+          }}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function describeScope(scope: string): { label: string; tag: string } {
+  // Pretty-print scope strings for the queue table. "session:abc-123" gets
+  // truncated; "rollup" / "all" show as a tag with a friendly name.
+  const force = scope.endsWith("+force");
+  const base = force ? scope.slice(0, -"+force".length) : scope;
+  if (base === "rollup") {
+    return { label: "rollup", tag: force ? "rollup • force" : "rollup" };
+  }
+  if (base === "all") {
+    return { label: "all", tag: force ? "all • force" : "all" };
+  }
+  if (base.startsWith("session:")) {
+    const sid = base.slice("session:".length);
+    const short = sid.length > 12 ? `${sid.slice(0, 8)}…${sid.slice(-3)}` : sid;
+    return { label: `session ${short}`, tag: force ? "session • force" : "session" };
+  }
+  return { label: scope, tag: scope };
+}
+
 function Row({ job, now }: { job: Job; now: number }) {
+  const { label, tag } = describeScope(job.scope);
   const pct =
     job.total != null && job.total > 0
       ? Math.min(100, Math.round(((job.done ?? 0) / job.total) * 100))
@@ -143,8 +281,6 @@ function Row({ job, now }: { job: Job; now: number }) {
       : job.status === "running"
         ? now - job.started_at
         : null;
-  // ETA: extrapolate remaining time from observed throughput. Only meaningful
-  // while running with at least one item completed.
   const eta =
     job.status === "running" &&
     job.total != null &&
@@ -157,10 +293,12 @@ function Row({ job, now }: { job: Job; now: number }) {
   return (
     <tr>
       <td>
-        <span className="nb-tag font-mono">{job.id.slice(0, 10)}</span>
-      </td>
-      <td>
-        <span className="nb-tag">{job.scope}</span>
+        <div className="flex items-center gap-2">
+          <span className="nb-tag font-mono text-[11px]" title={job.scope}>
+            {tag}
+          </span>
+          <span className="font-mono text-xs opacity-70">{label}</span>
+        </div>
       </td>
       <td>
         <span className="nb-chip" style={{ background: STATUS_COLOR[job.status] }}>
@@ -204,18 +342,14 @@ function Row({ job, now }: { job: Job; now: number }) {
               />
             </div>
             <span className="font-mono text-xs tabular-nums opacity-70">
-              {job.done ?? 0}/{job.total}
+              {job.done ?? 0}/{job.total ?? "?"}
             </span>
           </div>
         )}
       </td>
       <td className="opacity-80 whitespace-nowrap">{fmt.rel(job.started_at)}</td>
       <td className="text-right tabular-nums">
-        {duration == null ? (
-          <span className="opacity-40">—</span>
-        ) : (
-          msLabel(duration)
-        )}
+        {duration == null ? <span className="opacity-40">—</span> : msLabel(duration)}
       </td>
       <td className="text-right tabular-nums">
         {eta == null ? (
@@ -241,18 +375,15 @@ function RowActions({ job }: { job: Job }) {
     onError: (e) => alert(`Delete failed: ${String(e)}`),
   });
 
-  if (job.status === "running") {
+  if (job.status === "running" || job.status === "queued") {
     return (
       <button
         type="button"
         className="nb-chip"
         onClick={() => cancelMut.mutate()}
         disabled={cancelMut.isPending}
-        title="Stop this running job"
-        style={{
-          background: "var(--color-rose)",
-          cursor: "pointer",
-        }}
+        title={job.status === "running" ? "Stop this running task" : "Cancel before start"}
+        style={{ background: "var(--color-rose)", cursor: "pointer" }}
       >
         <StopIcon />
         {cancelMut.isPending ? "stopping…" : "stop"}
@@ -266,7 +397,7 @@ function RowActions({ job }: { job: Job }) {
       className="nb-chip"
       onClick={() => deleteMut.mutate()}
       disabled={deleteMut.isPending}
-      title="Remove this job from the queue"
+      title="Remove this task from the queue"
       style={{ cursor: "pointer" }}
       aria-label="delete"
     >

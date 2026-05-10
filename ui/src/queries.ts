@@ -299,10 +299,56 @@ export const insightsDatasetQuery = () =>
 // Jobs (analyze queue) — pushed live via SSE; fetched on mount + invalidate.
 // ---------------------------------------------------------------------------
 
-export const jobsListQuery = () =>
-  queryOptions<{ jobs: Job[] }>({
-    queryKey: qk.jobs.list,
-    queryFn: () => insightsApi.listJobs(),
+export const jobsListQuery = (params?: {
+  scopePrefix?: string;
+  status?: string;
+  limit?: number;
+  offset?: number;
+}) =>
+  queryOptions<{
+    jobs: Job[];
+    total?: number;
+    counts?: Record<string, number>;
+  }>({
+    // Include the params in the key so different filter / page combinations
+    // don't clobber each other in the cache.
+    queryKey: [
+      ...qk.jobs.list,
+      params?.scopePrefix ?? "",
+      params?.status ?? "",
+      params?.limit ?? 50,
+      params?.offset ?? 0,
+    ],
+    queryFn: () => insightsApi.listJobs(params),
+  });
+
+// Infinite-scroll companion. The Jobs page reads thousands of rows during a
+// fan-out — paging UI was clunky once N got large, so we mirror the
+// Sessions / Requests / Users pattern with a sentinel-driven infinite query.
+const JOBS_PAGE_SIZE = 50;
+export const jobsInfiniteQuery = (params?: {
+  scopePrefix?: string;
+  status?: string;
+}) =>
+  infiniteQueryOptions({
+    queryKey: [
+      ...qk.jobs.list,
+      "infinite",
+      params?.scopePrefix ?? "",
+      params?.status ?? "",
+    ],
+    queryFn: ({ pageParam = 0 }) =>
+      insightsApi.listJobs({
+        ...params,
+        limit: JOBS_PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, allPages) => {
+      const loaded = allPages.reduce((n, p) => n + p.jobs.length, 0);
+      const total = lastPage.total ?? loaded;
+      return loaded < total ? loaded : undefined;
+    },
   });
 
 export const jobDetailQuery = (id: string) =>

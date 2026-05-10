@@ -5,13 +5,21 @@ import { formatUsd, truncate } from "../../../insights/format";
 interface Props {
   cluster: Cluster;
   data: Dataset;
+  anonymized?: boolean;
 }
 
-export function ClusterDrawer({ cluster, data }: Props) {
+export function ClusterDrawer({ cluster, data, anonymized }: Props) {
   const memberSet = new Set(cluster.members);
   const sessions = data.sessions.filter((s) => memberSet.has(s.sessionId));
   const usersById = new Map(data.users.map((u) => [u.id, u] as const));
   const involvedUserIds = Array.from(new Set(sessions.map((s) => s.userId)));
+  const teamCounts = new Map<string, number>();
+  for (const uid of involvedUserIds) {
+    const team = usersById.get(uid)?.team;
+    if (!team) continue;
+    teamCounts.set(team, (teamCounts.get(team) ?? 0) + 1);
+  }
+  const teamsSorted = [...teamCounts.entries()].sort((a, b) => b[1] - a[1]);
 
   return (
     <div className="space-y-5">
@@ -39,17 +47,25 @@ export function ClusterDrawer({ cluster, data }: Props) {
       )}
 
       <div>
-        <SectionTitle>Engineers in this cluster</SectionTitle>
+        <SectionTitle>
+          {anonymized ? "Teams in this cluster" : "Engineers in this cluster"}
+        </SectionTitle>
         <div className="flex flex-wrap gap-2">
-          {involvedUserIds.map((uid) => {
-            const u = usersById.get(uid);
-            if (!u) return null;
-            return (
-              <span key={uid} className="nb-chip">
-                {u.displayName}
-              </span>
-            );
-          })}
+          {anonymized
+            ? teamsSorted.map(([team, n]) => (
+                <span key={team} className="nb-chip">
+                  {team} <span style={{ opacity: 0.6 }}>· {n}</span>
+                </span>
+              ))
+            : involvedUserIds.map((uid) => {
+                const u = usersById.get(uid);
+                if (!u) return null;
+                return (
+                  <span key={uid} className="nb-chip">
+                    {u.displayName}
+                  </span>
+                );
+              })}
         </div>
       </div>
 
@@ -69,8 +85,10 @@ export function ClusterDrawer({ cluster, data }: Props) {
                       {truncate(s.goal || s.projectName, 60)}
                     </div>
                     <div className="text-xs opacity-70">
-                      {u?.displayName ?? "—"} ·{" "}
-                      <span className="mono">{s.outcome}</span>
+                      {anonymized
+                        ? (u?.team ?? "—")
+                        : (u?.displayName ?? "—")}{" "}
+                      · <span className="mono">{s.outcome}</span>
                     </div>
                   </div>
                   <div className="mono text-sm">

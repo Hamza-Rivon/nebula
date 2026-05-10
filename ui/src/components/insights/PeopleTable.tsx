@@ -11,8 +11,6 @@ import { Sparkline } from "../Sparkline";
 
 interface Props {
   data: Dataset;
-  selectedUserId: string | null;
-  onSelectUser: (id: string) => void;
   onOpenUser: (id: string) => void;
 }
 
@@ -41,12 +39,7 @@ const PERSONA_LABEL: Record<Persona, string> = {
   lurker: "Lurker",
 };
 
-export function PeopleTable({
-  data,
-  selectedUserId,
-  onSelectUser,
-  onOpenUser,
-}: Props) {
+export function PeopleTable({ data, onOpenUser }: Props) {
   const [sortKey, setSortKey] = useState<SortKey>("persona");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
@@ -142,13 +135,10 @@ export function PeopleTable({
           </thead>
           <tbody>
             {rows.map(({ user, trend }) => {
-              const isSel = user.id === selectedUserId;
               return (
                 <tr
                   key={user.id}
-                  className={isSel ? "selected" : ""}
-                  onClick={() => onSelectUser(user.id)}
-                  onDoubleClick={() => onOpenUser(user.id)}
+                  onClick={() => onOpenUser(user.id)}
                 >
                   <td>
                     <PersonaChip persona={user.persona} />

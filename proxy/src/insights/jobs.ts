@@ -2,8 +2,8 @@ import { nanoid } from "nanoid";
 import { db, np } from "../db.js";
 import { publishEvent } from "../events.js";
 import {
-  runAnalyzeAll,
-  runAnalyzeSession,
+  analyzeOneSession,
+  runRollup,
   type AnalyzeOptions,
   type AnalyzeProgress,
 } from "./analyze.js";
@@ -18,9 +18,10 @@ class CancelledError extends Error {
 }
 
 // In-memory cancel signal for jobs currently in `running`. When a UI client
-// hits the cancel endpoint, we add the id here. The runner inspects this set
-// on every progress callback (every parse iteration, every embed/extract
-// resolution) and throws CancelledError to unwind the pipeline.
+// hits the cancel endpoint, we add the id here. Workers consult it at await
+// boundaries; the per-session pipeline doesn't need fine-grained cancellation
+// (each task is a single LLM call), so we just refuse to start new work for
+// a cancelled id.
 const cancelRequested = new Set<string>();
 
 export type Job = {
@@ -49,6 +50,7 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_analyze_jobs_started ON analyze_jobs(started_at DESC);
   CREATE INDEX IF NOT EXISTS idx_analyze_jobs_status ON analyze_jobs(status);
+  CREATE INDEX IF NOT EXISTS idx_analyze_jobs_scope ON analyze_jobs(scope);
 `);
 
 // Recover from previous abrupt shutdowns: any row left in 'running' is stale.
@@ -68,9 +70,6 @@ const selectByIdStmt = db.prepare(`SELECT * FROM analyze_jobs WHERE id = ?`);
 const selectRecentStmt = db.prepare(
   `SELECT * FROM analyze_jobs ORDER BY started_at DESC LIMIT ?`,
 );
-const selectNextQueuedStmt = db.prepare(
-  `SELECT * FROM analyze_jobs WHERE status = 'queued' ORDER BY started_at ASC LIMIT 1`,
-);
 const selectActiveByScopeStmt = db.prepare(
   `SELECT * FROM analyze_jobs
    WHERE scope = ? AND status IN ('queued', 'running')
@@ -86,10 +85,48 @@ const updateFinishStmt = db.prepare(
   `UPDATE analyze_jobs SET status = @status, error = @error, finished_at = @finished_at WHERE id = @id`,
 );
 
-// Per-job throttle for progress emissions. Status transitions (queued →
-// running → done/error) and enqueue always emit immediately; progress events
-// are coalesced so an analyze pass with 1000 sessions doesn't fan out 1000
-// SSE messages.
+// Multi-worker scheduler. Atomically claim the next queued job by id so two
+// workers never grab the same row.
+const claimQueuedSessionStmt = db.prepare(
+  `UPDATE analyze_jobs
+     SET status = 'running'
+     WHERE id = (
+       SELECT id FROM analyze_jobs
+        WHERE status = 'queued' AND scope LIKE 'session:%'
+        ORDER BY started_at ASC
+        LIMIT 1
+     )
+     RETURNING *`,
+);
+const claimQueuedRollupStmt = db.prepare(
+  `UPDATE analyze_jobs
+     SET status = 'running'
+     WHERE id = (
+       SELECT id FROM analyze_jobs
+        WHERE status = 'queued' AND (scope = 'rollup' OR scope = 'rollup+force')
+        ORDER BY started_at ASC
+        LIMIT 1
+     )
+     RETURNING *`,
+);
+const countQueuedSessionsStmt = db.prepare(
+  `SELECT COUNT(*) AS n FROM analyze_jobs
+    WHERE status IN ('queued', 'running') AND scope LIKE 'session:%'`,
+);
+
+// Live status priority for the queue table: running > queued > done >
+// cancelled > error. Within each bucket, newest first by started_at.
+// SQLite has no enum-aware ORDER BY so we project a numeric priority.
+const STATUS_PRIORITY_SQL = `CASE status
+    WHEN 'running' THEN 0
+    WHEN 'queued' THEN 1
+    WHEN 'done' THEN 2
+    WHEN 'cancelled' THEN 3
+    WHEN 'error' THEN 4
+    ELSE 5
+  END`;
+
+// Per-job throttle for progress emissions.
 const PROGRESS_THROTTLE_MS = 250;
 const lastEmitAt = new Map<string, number>();
 
@@ -103,7 +140,7 @@ function emit(id: string, force = false): void {
   if (!job) return;
   lastEmitAt.set(id, now);
   publishEvent({ type: "job", job });
-  if (job.status === "done" || job.status === "error") {
+  if (job.status === "done" || job.status === "error" || job.status === "cancelled") {
     lastEmitAt.delete(id);
   }
 }
@@ -132,16 +169,39 @@ export function listJobs(limit = 20): Job[] {
   return rows.map(rowToJob);
 }
 
-let running = false;
+// New: list with optional scope-prefix filter and pagination. The Jobs page
+// uses this so 1k+ session task rows don't all rush down the wire at once.
+export function listJobsFiltered(opts: {
+  scopePrefix?: string;
+  status?: JobStatus;
+  limit: number;
+  offset: number;
+}): { jobs: Job[]; total: number } {
+  const where: string[] = [];
+  const params: any[] = [];
+  if (opts.scopePrefix) {
+    where.push(`scope LIKE ?`);
+    params.push(`${opts.scopePrefix}%`);
+  }
+  if (opts.status) {
+    where.push(`status = ?`);
+    params.push(opts.status);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const total = (db
+    .prepare(`SELECT COUNT(*) AS n FROM analyze_jobs ${whereSql}`)
+    .get(...params) as { n: number }).n;
+  const rows = db
+    .prepare(
+      `SELECT * FROM analyze_jobs ${whereSql}
+       ORDER BY ${STATUS_PRIORITY_SQL} ASC, started_at DESC
+       LIMIT ? OFFSET ?`,
+    )
+    .all(...params, opts.limit, opts.offset) as any[];
+  return { jobs: rows.map(rowToJob), total };
+}
 
-export function enqueueJob(scope: string): Job {
-  // Coalesce: if there's already a queued or running job with this exact scope,
-  // hand back that one instead of piling up duplicates. Repeated POSTs from a
-  // racy UI, or a seed step that re-enqueues "all" on every restart, both
-  // collapse to a single in-flight job.
-  const active = selectActiveByScopeStmt.get(scope) as any;
-  if (active) return rowToJob(active);
-
+function insertJob(scope: string): Job {
   const id = nanoid();
   const now = Date.now();
   insertStmt.run(
@@ -158,12 +218,106 @@ export function enqueueJob(scope: string): Job {
     }),
   );
   emit(id, true);
-  // Kick the runner asynchronously; if a job is already running, this is a no-op
-  // (the runner will pick the next queued job when it finishes).
-  setImmediate(() => {
-    void tick();
-  });
   return getJob(id)!;
+}
+
+// Public entry. Three meaningful scope shapes:
+//   "all" | "all+force"           -> fan out per-session jobs + a rollup.
+//   "session:<id>" | "...+force"  -> single session task, no rollup.
+//   "rollup" | "rollup+force"     -> rebuild clusters/aggregates only.
+//
+// Coalesces against currently active rows of the same scope so racy clicks
+// or boot-time auto-enqueue don't pile up duplicates.
+export function enqueueJob(scope: string): Job {
+  const force = scope.endsWith("+force");
+  const baseScope = force ? scope.slice(0, -"+force".length) : scope;
+
+  if (baseScope === "all") {
+    return enqueueAll(force);
+  }
+
+  // Coalesce single-session and rollup scopes.
+  const active = selectActiveByScopeStmt.get(scope) as any;
+  if (active) {
+    kickWorkers();
+    return rowToJob(active);
+  }
+  const job = insertJob(scope);
+  kickWorkers();
+  return job;
+}
+
+// Fan-out for "all": one task per session in the corpus, plus a single
+// rollup task. Each session row has its own progress (1/1) so the Jobs page
+// reads as a queue of tasks, not a single 1358-step job.
+function enqueueAll(force: boolean): Job {
+  // Coalesce: if there's already a running fan-out (rollup or session jobs
+  // pending), return that as the "anchor" job — the visible signal is the
+  // rollup row at the tail, so prefer that one.
+  const activeRollup = selectActiveByScopeStmt.get(
+    force ? "rollup+force" : "rollup",
+  ) as any;
+  if (activeRollup) {
+    kickWorkers();
+    return rowToJob(activeRollup);
+  }
+
+  const sessionIds = (
+    db.prepare(`SELECT id FROM sessions ORDER BY created_at ASC`).all() as {
+      id: string;
+    }[]
+  ).map((r) => r.id);
+
+  // Skip sessions that already have queued/running jobs to avoid duplicates
+  // when "all" is re-clicked while a previous fan-out is still draining.
+  const activeSessionScopes = new Set(
+    (db
+      .prepare(
+        `SELECT scope FROM analyze_jobs
+          WHERE status IN ('queued', 'running') AND scope LIKE 'session:%'`,
+      )
+      .all() as { scope: string }[]).map((r) => r.scope),
+  );
+
+  const tx = db.transaction(() => {
+    for (const sid of sessionIds) {
+      const sessionScope = force ? `session:${sid}+force` : `session:${sid}`;
+      if (activeSessionScopes.has(sessionScope)) continue;
+      insertStmt.run(
+        np({
+          id: nanoid(),
+          scope: sessionScope,
+          status: "queued",
+          stage: null,
+          total: 1,
+          done: 0,
+          error: null,
+          started_at: Date.now(),
+          finished_at: null,
+        }),
+      );
+    }
+  });
+  tx();
+
+  const rollupScope = force ? "rollup+force" : "rollup";
+  const rollup = insertJob(rollupScope);
+  // Emit a job event for each freshly queued session task so the UI's live
+  // Jobs page populates immediately. We can't easily collect their ids inside
+  // the transaction, so re-query for any queued session jobs and broadcast.
+  const queued = db
+    .prepare(
+      `SELECT * FROM analyze_jobs
+        WHERE status = 'queued' AND scope LIKE 'session:%'
+        ORDER BY started_at ASC`,
+    )
+    .all() as any[];
+  for (const r of queued) {
+    publishEvent({ type: "job", job: rowToJob(r) });
+  }
+
+  kickWorkers();
+  return rollup;
 }
 
 function buildOptions(): AnalyzeOptions {
@@ -179,40 +333,179 @@ function buildOptions(): AnalyzeOptions {
   return opts;
 }
 
-async function tick(): Promise<void> {
-  if (running) return;
-  const next = selectNextQueuedStmt.get() as any;
-  if (!next) return;
-  running = true;
-  const id = next.id as string;
-  const scope = next.scope as string;
+// Multi-worker scheduling. Each worker is an async loop that claims the next
+// queued session task and runs it. A separate single-flight slot runs rollup
+// once all session tasks have drained.
+const MAX_WORKERS = Math.max(
+  1,
+  Number(process.env.NEBULA_ANALYZE_WORKERS ?? 8),
+);
+let activeSessionWorkers = 0;
+let rollupRunning = false;
+// Set when any worker is mid-tick — used to coalesce kicks.
+let pendingKicks = 0;
 
-  updateStatusStmt.run(np({ id, status: "running" }));
-  emit(id, true);
+function kickWorkers(): void {
+  // Spin up additional session workers up to the cap.
+  while (activeSessionWorkers < MAX_WORKERS) {
+    activeSessionWorkers++;
+    void sessionWorkerLoop().finally(() => {
+      activeSessionWorkers--;
+      // After each session task wraps, re-evaluate whether the rollup can run.
+      maybeStartRollup();
+    });
+  }
+  maybeStartRollup();
+  pendingKicks++;
+}
 
+async function sessionWorkerLoop(): Promise<void> {
+  for (;;) {
+    const claimed = claimQueuedSessionStmt.get() as any;
+    if (!claimed) return;
+    const job = rowToJob(claimed);
+    if (cancelRequested.has(job.id)) {
+      updateFinishStmt.run(
+        np({
+          id: job.id,
+          status: "cancelled",
+          error: "cancelled before start",
+          finished_at: Date.now(),
+        }),
+      );
+      cancelRequested.delete(job.id);
+      emit(job.id, true);
+      continue;
+    }
+    emit(job.id, true);
+    await runSessionTask(job);
+  }
+}
+
+async function runSessionTask(job: Job): Promise<void> {
+  const force = job.scope.endsWith("+force");
+  const base = force ? job.scope.slice(0, -"+force".length) : job.scope;
+  const sid = base.slice("session:".length);
+
+  updateProgressStmt.run(
+    np({ id: job.id, stage: "extract", total: 1, done: 0 }),
+  );
+  emit(job.id, true);
+
+  const opts: AnalyzeOptions = { ...buildOptions(), force };
+  try {
+    const meta = await analyzeOneSession(sid, opts);
+    if (!meta) {
+      updateFinishStmt.run(
+        np({
+          id: job.id,
+          status: "error",
+          error: "session not found",
+          finished_at: Date.now(),
+        }),
+      );
+    } else {
+      updateProgressStmt.run(
+        np({ id: job.id, stage: "extract", total: 1, done: 1 }),
+      );
+      updateFinishStmt.run(
+        np({
+          id: job.id,
+          status: "done",
+          error: null,
+          finished_at: Date.now(),
+        }),
+      );
+    }
+  } catch (err) {
+    const msg = (err as { message?: string } | null)?.message ?? String(err);
+    updateFinishStmt.run(
+      np({
+        id: job.id,
+        status: "error",
+        error: msg,
+        finished_at: Date.now(),
+      }),
+    );
+  } finally {
+    emit(job.id, true);
+    sessionsCompletedSinceCheckpoint++;
+    // Every batch of completed session tasks we may queue a checkpoint
+    // rollup so clusters / per-user aggregates refresh while the fan-out
+    // is still draining. Coalesces against any active rollup.
+    maybeQueueCheckpointRollup();
+  }
+}
+
+function maybeStartRollup(): void {
+  if (rollupRunning) return;
+  // No gate on remaining session jobs anymore: the rollup operates only on
+  // already-analyzed sessions (see analyze.ts/runRollup), so it's safe and
+  // useful to run it concurrently with the per-session fan-out. This is what
+  // makes clusters / per-user aggregates update live in the Insights tab.
+  const claimed = claimQueuedRollupStmt.get() as any;
+  if (!claimed) return;
+  rollupRunning = true;
+  const job = rowToJob(claimed);
+  emit(job.id, true);
+  void runRollupTask(job).finally(() => {
+    rollupRunning = false;
+    // A rollup might've been queued while another was running — drain.
+    maybeStartRollup();
+  });
+}
+
+// Throttle checkpoint rollups during fan-out. We don't want to enqueue a
+// fresh rollup after every session task — kmeans + UMAP + aggregate math
+// over 1k+ sessions is cheap but not free. A checkpoint runs at most every
+// CHECKPOINT_INTERVAL_MS, and only after CHECKPOINT_MIN_NEW sessions have
+// been analyzed since the last enqueue.
+const CHECKPOINT_INTERVAL_MS = 8_000;
+const CHECKPOINT_MIN_NEW = 25;
+let sessionsCompletedSinceCheckpoint = 0;
+let lastCheckpointAt = 0;
+
+function maybeQueueCheckpointRollup(): void {
+  const remaining = (countQueuedSessionsStmt.get() as { n: number }).n;
+  const queueDraining = remaining === 0;
+  const now = Date.now();
+  // Bypass throttle when the per-session queue is empty so the FINAL rollup
+  // always reflects 100% of analyzed sessions, even if the last task landed
+  // milliseconds after the previous checkpoint.
+  if (!queueDraining) {
+    if (now - lastCheckpointAt < CHECKPOINT_INTERVAL_MS) return;
+    if (sessionsCompletedSinceCheckpoint < CHECKPOINT_MIN_NEW) return;
+  } else if (sessionsCompletedSinceCheckpoint === 0) {
+    return;
+  }
+  // Coalesce: a rollup row already queued/running absorbs this trigger.
+  const active = selectActiveByScopeStmt.get("rollup") as any;
+  if (active) return;
+  sessionsCompletedSinceCheckpoint = 0;
+  lastCheckpointAt = now;
+  insertJob("rollup");
+  maybeStartRollup();
+}
+
+async function runRollupTask(job: Job): Promise<void> {
+  const force = job.scope.endsWith("+force");
   const onProgress = (p: AnalyzeProgress) => {
-    // Check first — throwing from onProgress unwinds the pipeline at the next
-    // await boundary, so cancellation is observed within ~one stage step.
-    if (cancelRequested.has(id)) throw new CancelledError();
+    if (cancelRequested.has(job.id)) throw new CancelledError();
     try {
       updateProgressStmt.run(
         np({
-          id,
-          stage: (p as any)?.stage ?? null,
-          total: (p as any)?.total ?? null,
-          done: (p as any)?.done ?? null,
+          id: job.id,
+          stage: p.stage ?? null,
+          total: p.total ?? null,
+          done: p.done ?? null,
         }),
       );
-      emit(id);
+      emit(job.id);
     } catch (err) {
-      // Re-raise CancelledError; swallow only DB write failures.
       if (err instanceof CancelledError) throw err;
     }
   };
 
-  // Scope grammar: "all" | "all+force" | "session:<id>" | "session:<id>+force".
-  const force = scope.endsWith("+force");
-  const baseScope = force ? scope.slice(0, -"+force".length) : scope;
   const opts: AnalyzeOptions = {
     ...buildOptions(),
     onProgress,
@@ -220,23 +513,16 @@ async function tick(): Promise<void> {
   } as AnalyzeOptions;
 
   try {
-    if (baseScope === "all") {
-      await runAnalyzeAll(opts);
-    } else if (baseScope.startsWith("session:")) {
-      const sid = baseScope.slice("session:".length);
-      await runAnalyzeSession(sid, opts);
-    } else {
-      throw new Error(`unknown scope: ${scope}`);
-    }
+    await runRollup(opts);
     updateFinishStmt.run(
       np({
-        id,
+        id: job.id,
         status: "done",
         error: null,
         finished_at: Date.now(),
       }),
     );
-    emit(id, true);
+    publishEvent({ type: "aggregates_updated" });
   } catch (err) {
     const cancelled = err instanceof CancelledError;
     const msg = cancelled
@@ -244,29 +530,23 @@ async function tick(): Promise<void> {
       : ((err as { message?: string } | null)?.message ?? String(err));
     updateFinishStmt.run(
       np({
-        id,
+        id: job.id,
         status: cancelled ? "cancelled" : "error",
         error: msg,
         finished_at: Date.now(),
       }),
     );
-    emit(id, true);
   } finally {
-    cancelRequested.delete(id);
-    running = false;
-    // Drain any further queued rows.
-    setImmediate(() => {
-      void tick();
-    });
+    cancelRequested.delete(job.id);
+    emit(job.id, true);
   }
 }
 
-// Cancel a job. For `queued` rows this is immediate — the row never ran, so
-// we just record the terminal status and emit. For `running` rows we set the
-// in-memory flag; the next progress callback throws CancelledError, the
-// runner catches it and writes status='cancelled'.
-//
-// Returns the (possibly transitional) Job, or null when nothing matched.
+// Cancel a job. Queued session/rollup rows transition straight to cancelled.
+// Running rows: we set the in-memory flag; the rollup pipeline observes it at
+// its next progress callback. Per-session tasks are short (single LLM call),
+// so we let them finish — the cost of one wasted call beats unwinding the
+// extract mid-flight.
 export function cancelJob(id: string): Job | null {
   const existing = getJob(id);
   if (!existing) return null;
@@ -286,15 +566,11 @@ export function cancelJob(id: string): Job | null {
     cancelRequested.add(id);
     return existing;
   }
-  // Already terminal — nothing to cancel.
   return existing;
 }
 
 const deleteStmt = db.prepare(`DELETE FROM analyze_jobs WHERE id = ?`);
 
-// Delete a job row. Refuses to delete a running job (caller must cancel
-// first); for any other status the row is removed and a `job_deleted` event
-// is published so subscribers can drop their cached copy.
 export function deleteJob(id: string): { ok: true } | { ok: false; reason: string } {
   const existing = getJob(id);
   if (!existing) return { ok: false, reason: "not_found" };
@@ -306,3 +582,30 @@ export function deleteJob(id: string): { ok: true } | { ok: false; reason: strin
   publishEvent({ type: "job_deleted", id });
   return { ok: true };
 }
+
+// Used by index.ts boot path: resume any queued tasks left over from a
+// previous restart.
+export function resumeQueuedJobs(): void {
+  kickWorkers();
+}
+
+// Surface stats for the Jobs page header at-a-glance.
+export function jobCounts(): {
+  queued: number;
+  running: number;
+  done: number;
+  error: number;
+  cancelled: number;
+} {
+  const rows = db
+    .prepare(
+      `SELECT status, COUNT(*) AS n FROM analyze_jobs GROUP BY status`,
+    )
+    .all() as { status: JobStatus; n: number }[];
+  const out = { queued: 0, running: 0, done: 0, error: 0, cancelled: 0 };
+  for (const r of rows) out[r.status] = r.n;
+  return out;
+}
+
+// Reference unused vars defensively so stricter linters don't complain.
+void pendingKicks;

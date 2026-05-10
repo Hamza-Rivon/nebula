@@ -6,14 +6,17 @@ import pLimit from "p-limit";
 import { kmeans } from "ml-kmeans";
 import { UMAP } from "umap-js";
 import { db } from "../db.js";
+import { publishEvent } from "../events.js";
 import {
   getCachedClusterLabel,
   getCachedEmbedding,
+  getCachedExtract,
   getSession,
   getUserIdByRaw,
   listRawUserMappings,
   putCachedClusterLabel,
   putCachedEmbeddings,
+  putCachedExtract,
   setAggregates,
   setConfig,
   setGeneratedAt,
@@ -178,6 +181,37 @@ function inferPersona(args: {
   if (sessionsTotal >= 12 && winRate >= 0.7 && wastePct < 0.2) return "power";
   if (winRate < 0.4 && sessionsTotal >= 4) return "stuck";
   return "active";
+}
+
+// Cap a session's waste flags to the session cost. Each flag is first
+// individually clamped at `costUsd` so a single rule (e.g. retry_loop's
+// turn-count heuristic) can't overshoot. Then if multiple flags collectively
+// exceed `costUsd` they're scaled down proportionally so the persisted
+// `wasteUsd` (= sum of usdWasted) is always ≤ costUsd. tokensWasted gets the
+// same scale so per-flag ratios stay consistent. The fundamental invariant:
+// "you can't waste more dollars than you spent."
+function capWasteFlags(flags: WasteFlag[], costUsd: number): WasteFlag[] {
+  if (flags.length === 0) return flags;
+  if (costUsd <= 0) {
+    return flags.map((f) => ({ ...f, usdWasted: 0, tokensWasted: 0 }));
+  }
+  const clamped = flags.map((f) => {
+    if (f.usdWasted <= costUsd) return f;
+    const scale = costUsd / f.usdWasted;
+    return {
+      ...f,
+      usdWasted: costUsd,
+      tokensWasted: Math.round(f.tokensWasted * scale),
+    };
+  });
+  const total = clamped.reduce((a, w) => a + w.usdWasted, 0);
+  if (total <= costUsd) return clamped;
+  const scale = costUsd / total;
+  return clamped.map((f) => ({
+    ...f,
+    usdWasted: f.usdWasted * scale,
+    tokensWasted: Math.round(f.tokensWasted * scale),
+  }));
 }
 
 function categorizeToolError(content: string): string {
@@ -861,11 +895,19 @@ async function extractFacets(
   const cacheKey = `${raw.sessionId}|${raw.endedAt}`;
   const cached = extractCache.get(cacheKey);
   if (cached) return cached;
-  // Persisted-cache short-circuit: if this session already has an analyzed
-  // SessionMeta in storage and the caller didn't set force=true, reconstruct
-  // the Extracted shape from it and skip the LLM call. This is what makes
-  // re-analyze cheap: only newly-seeded sessions hit the model.
+  // Persisted-cache short-circuit. Two layers, both keyed by session+endedAt:
+  //   1. insights_extracts: written per-session inside this function, so a
+  //      run that's killed mid-extract still saves every prior LLM call. This
+  //      is what makes a restart resume instead of redoing 1000+ extractions.
+  //   2. insights_sessions: written only at the final pipeline transaction.
+  //      Reuse it when present so a clean previous run still short-circuits
+  //      even before the per-session cache table existed.
   if (!opts.force) {
+    const persisted = getCachedExtract<Extracted>(raw.sessionId, raw.endedAt);
+    if (persisted) {
+      extractCache.set(cacheKey, persisted);
+      return persisted;
+    }
     const stored = getSession(raw.sessionId);
     if (stored) {
       const reconstructed: Extracted = {
@@ -891,12 +933,15 @@ async function extractFacets(
         task_hardness: 3,
       };
       extractCache.set(cacheKey, reconstructed);
+      putCachedExtract(raw.sessionId, raw.endedAt, reconstructed);
       return reconstructed;
     }
   }
   if (!llmAvailable) {
     const f = extractFallback(raw);
     extractCache.set(cacheKey, f);
+    // Don't persist fallback: a future run with the LLM available should
+    // re-extract instead of being stuck with the deterministic placeholder.
     return f;
   }
   let transcript = raw.transcript;
@@ -928,6 +973,7 @@ ${transcript.slice(0, 30000)}`;
   try {
     const object = await chatJSON(opts, prompt, ExtractSchema, { maxTokens: 3000 });
     extractCache.set(cacheKey, object);
+    putCachedExtract(raw.sessionId, raw.endedAt, object);
     return object;
   } catch {
     const f = extractFallback(raw);
@@ -1518,7 +1564,8 @@ async function runPipeline(
         evidence: "first prompt overlaps a high-frequency cluster",
       });
     }
-    const wasteUsd = wasteFlags.reduce((a, w) => a + w.usdWasted, 0);
+    const cappedFlags = capWasteFlags(wasteFlags, r.costUsd);
+    const wasteUsd = cappedFlags.reduce((a, w) => a + w.usdWasted, 0);
 
     const tpZ = (throughputs[idx]! - tpMean) / tpStd;
     const tpNorm = sigmoid(tpZ);
@@ -1583,7 +1630,7 @@ async function runPipeline(
       filesModified: r.filesModified,
       costUsd: r.costUsd,
       wasteUsd,
-      wasteFlags,
+      wasteFlags: cappedFlags,
       wizardScore,
       goal: ex.goal,
       outcome: ex.outcome,
@@ -1845,23 +1892,294 @@ ${canonicalSamples.map((s, i) => `${i + 1}. ${s}`).join("\n")}`,
 }
 
 // ---------- public entry points ----------
-export async function runAnalyzeAll(
-  opts: AnalyzeOptions,
-): Promise<{ userCount: number; sessionCount: number; clusterCount: number }> {
-  const sessionRows = db
-    .prepare(`SELECT id FROM sessions ORDER BY created_at ASC`)
-    .all() as { id: string }[];
-  const ids = sessionRows.map((r) => r.id);
-  return runPipeline(ids, opts);
+// `analyzeOneSession` and `runRollup` (defined below) are the live entry
+// points. They replace the old monolithic `runAnalyzeAll` / `runAnalyzeSession`
+// — fan-out is now driven by the job runner so per-session results land in
+// the UI as they're produced.
+
+// ---------- per-session incremental analyze ----------
+//
+// Two-tier execution model. The classic full-corpus pass runs in
+// `runPipeline` (parse + extract + cluster + label + aggregate + persist) and
+// is now used only as the rollup at the end. Day-to-day work happens via
+// `analyzeOneSession`: parse one session, run the LLM extract for it, and
+// write a partial `SessionMeta` to `insights_sessions` immediately. The UI
+// receives a `session_analyzed` SSE event and patches its dataset cache, so
+// users watch sessions land progressively instead of staring at a spinner.
+//
+// What's "partial" about it:
+// - `clusterId` is missing on every Ask / Unresolved (clustering needs the
+//   full corpus and runs in rollup).
+// - `redundant_prompt` waste flag isn't set (also needs cross-session
+//   first-prompt clustering).
+// - `wizardScore` uses a neutral throughput term (z-score across the corpus
+//   is a rollup-only computation).
+//
+// The rollup pass overwrites these fields with the final values.
+
+// Pick or allocate an insights user id for this raw user, persisting the
+// row immediately so concurrent session tasks see consistent assignments.
+// The first time a raw_user_id is seen, we mint a fresh "u<N>" id, taking
+// care to skip ids already claimed in `insights_users`.
+function ensureUserForRaw(rawUserId: string | null): string {
+  const existing = getUserIdByRaw(rawUserId);
+  if (existing) return existing;
+
+  const taken = new Set(listRawUserMappings().map((m) => m.id));
+  let nextIdx = 1;
+  while (taken.has(`u${nextIdx}`)) nextIdx++;
+  const id = `u${nextIdx}`;
+
+  let displayName: string;
+  if (rawUserId && looksLikeRealHandle(rawUserId)) {
+    displayName = rawUserId;
+  } else {
+    const seedKey = rawUserId ?? "anonymous";
+    const idx = djb2(seedKey) % NAMES.length;
+    displayName = NAMES[idx]!;
+  }
+  const teamSeed = rawUserId ?? "anonymous";
+  const team = TEAMS[djb2(teamSeed) % TEAMS.length]!;
+
+  const user: User = {
+    id,
+    displayName,
+    team,
+    avatarSeed: id,
+    sessionCount: 0,
+    totalTokens: 0,
+    totalCostUsd: 0,
+    totalWasteUsd: 0,
+    wizardScore: 0,
+    outcomes: { fully: 0, mostly: 0, partial: 0, none: 0, unclear: 0 },
+    topTools: {},
+    topFrictions: {},
+    winRate: 0,
+    costPerWin: 0,
+    lastActiveAt: new Date(0).toISOString(),
+    sessionsLast7d: 0,
+    persona: "lurker",
+    topFrictionLabel: "no recurring friction",
+  };
+  upsertUser(user, rawUserId);
+  return id;
 }
 
-export async function runAnalyzeSession(
+function buildPartialSessionMeta(
+  raw: RawParse,
+  ex: Extracted,
+  userId: string,
+): SessionMeta {
+  // Per-session waste flags. Cross-session ones (redundant_prompt) are filled
+  // in by the rollup pass. The wrong_model flag depends only on `task_hardness`
+  // which is per-session, so we compute it here.
+  const wasteFlags: WasteFlag[] = [];
+  const opusCost = raw.modelTurnCosts
+    .filter((m) => m.model.includes("opus"))
+    .reduce((a, m) => a + m.cost, 0);
+  const opusTokens = raw.modelTurnCosts
+    .filter((m) => m.model.includes("opus"))
+    .reduce(
+      (a, m) => a + (m.usage?.input_tokens ?? 0) + (m.usage?.output_tokens ?? 0),
+      0,
+    );
+  if (ex.task_hardness <= 2 && opusCost > 0) {
+    const hp = priceFor("claude-haiku-4-5");
+    let haikuEquivCost = 0;
+    for (const m of raw.modelTurnCosts) {
+      if (m.model.includes("opus")) {
+        const u = m.usage ?? {};
+        haikuEquivCost +=
+          ((u.input_tokens ?? 0) * hp.input +
+            (u.output_tokens ?? 0) * hp.output +
+            (u.cache_read_input_tokens ?? 0) * hp.cacheRead +
+            (u.cache_creation_input_tokens ?? 0) * hp.cacheWrite) /
+          1e6;
+      }
+    }
+    const wasted = Math.max(0, opusCost - haikuEquivCost);
+    if (wasted > 0) {
+      wasteFlags.push({
+        type: "wrong_model",
+        tokensWasted: opusTokens,
+        usdWasted: wasted,
+        evidence: `opus used on hardness=${ex.task_hardness}`,
+      });
+    }
+  }
+  if (raw.retryLoops > 0) {
+    const avgPerTurn = raw.costUsd / Math.max(1, raw.modelTurnCosts.length);
+    const wasted = avgPerTurn * raw.retryLoops * 2;
+    const tokensWasted = Math.round(
+      ((raw.tokens.input + raw.tokens.output) /
+        Math.max(1, raw.modelTurnCosts.length)) *
+        raw.retryLoops *
+        2,
+    );
+    wasteFlags.push({
+      type: "retry_loop",
+      tokensWasted,
+      usdWasted: wasted,
+      evidence: `${raw.retryLoops} duplicate tool_use within k=5`,
+    });
+  }
+  if (raw.abandoned) {
+    wasteFlags.push({
+      type: "abandoned",
+      tokensWasted: raw.tokens.input + raw.tokens.output,
+      usdWasted: raw.costUsd,
+      evidence: "tool_result errors at end with no human reply",
+    });
+  }
+  if (raw.tokens.input > 100000) {
+    const tu = Object.values(raw.tools).reduce((a, b) => a + b, 0);
+    const ratio = tu / Math.max(1, raw.tokens.input);
+    if (ratio < 0.0002) {
+      const inputCost =
+        (raw.tokens.input * priceFor(Object.keys(raw.models)[0] ?? "").input) / 1e6;
+      wasteFlags.push({
+        type: "context_bloat",
+        tokensWasted: Math.round(raw.tokens.input * 0.3),
+        usdWasted: inputCost * 0.3,
+        evidence: `input=${raw.tokens.input} tool_uses=${tu}`,
+      });
+    }
+  }
+  const cappedFlags = capWasteFlags(wasteFlags, raw.costUsd);
+  const wasteUsd = cappedFlags.reduce((a, w) => a + w.usdWasted, 0);
+
+  // Neutral throughput term until rollup observes the corpus distribution.
+  const tpNorm = 0.5;
+  const toolUseTotal = Object.values(raw.tools).reduce((a, b) => a + b, 0);
+  const firstShotSuccess = 1 - raw.toolErrors / Math.max(1, toolUseTotal);
+  const cacheHit =
+    raw.tokens.cacheRead /
+    Math.max(1, raw.tokens.input + raw.tokens.cacheRead);
+  const editEff = 1 - raw.branchPoints / Math.max(1, raw.turns);
+  const reqTier =
+    ex.task_hardness <= 2 ? "easy" : ex.task_hardness === 3 ? "med" : "hard";
+  let iqHits = 0;
+  let iqTotal = 0;
+  for (const [m, count] of Object.entries(raw.models)) {
+    const tier = m.includes("opus")
+      ? "hard"
+      : m.includes("sonnet")
+        ? "med"
+        : m.includes("haiku")
+          ? "easy"
+          : "med";
+    iqTotal += count;
+    if (tier === reqTier) iqHits += count;
+  }
+  const modelIQ = iqTotal > 0 ? iqHits / iqTotal : 0.5;
+  const wizardScore =
+    0.25 * tpNorm +
+    0.25 * firstShotSuccess +
+    0.2 * cacheHit +
+    0.15 * editEff +
+    0.15 * modelIQ;
+
+  const asks: Ask[] = ex.asks.map((a) => ({
+    intent: a.intent,
+    artifact: a.artifact,
+    text: a.text,
+  }));
+  const unresolved: Unresolved[] = ex.unresolved.map((u) => ({
+    topic: u.topic,
+    framing: u.framing,
+  }));
+
+  return {
+    sessionId: raw.sessionId,
+    userId,
+    filePath: raw.filePath,
+    projectName: raw.projectName,
+    startedAt: raw.startedAt,
+    endedAt: raw.endedAt,
+    durationMinutes: Math.round(raw.durationMinutes * 10) / 10,
+    userMessageCount: raw.userMessageCount,
+    assistantMessageCount: raw.assistantMessageCount,
+    turns: raw.turns,
+    tokens: raw.tokens,
+    models: raw.models,
+    tools: raw.tools,
+    toolErrors: raw.toolErrors,
+    toolErrorCategories: raw.toolErrorCategories,
+    userInterruptions: raw.userInterruptions,
+    branchPoints: raw.branchPoints,
+    retryLoops: raw.retryLoops,
+    abandoned: raw.abandoned,
+    linesAdded: raw.linesAdded,
+    linesRemoved: raw.linesRemoved,
+    filesModified: raw.filesModified,
+    costUsd: raw.costUsd,
+    wasteUsd,
+    wasteFlags: cappedFlags,
+    wizardScore,
+    goal: ex.goal,
+    outcome: ex.outcome,
+    sessionType: ex.session_type,
+    friction: ex.friction,
+    primarySuccess: ex.primary_success,
+    briefSummary: ex.brief_summary,
+    asks,
+    unresolved,
+    firstPrompt: raw.firstPrompt,
+  };
+}
+
+// Run the LLM extract for one session and persist a partial SessionMeta.
+// Idempotent: re-running with no force flag short-circuits via the on-disk
+// extract cache the moment the session was first analyzed.
+export async function analyzeOneSession(
   sessionId: string,
   opts: AnalyzeOptions,
-): Promise<void> {
-  await runPipeline([sessionId], opts);
+): Promise<SessionMeta | null> {
+  const raw = parseSessionFromDb(sessionId);
+  if (!raw) return null;
+  const llmAvailable = !!(opts.apiBaseUrl && opts.apiKey && opts.model);
+  const ex = await extractFacets(raw, opts, llmAvailable);
+  const userId = ensureUserForRaw(raw.rawUserId);
+  const meta = buildPartialSessionMeta(raw, ex, userId);
+  upsertSession(meta);
+  // Persist the transcript as part of the per-session task too — the UI's
+  // session detail page reads from `insights_transcripts`.
+  upsertTranscript({
+    sessionId: raw.sessionId,
+    events: raw.events,
+    truncated: raw.events.length >= TX_MAX_EVENTS,
+  });
+  publishEvent({ type: "session_analyzed", session: meta });
+  return meta;
 }
 
-// keep getUserIdByRaw imported (not currently called but kept for symmetry/
-// the other agent might rely on it); reference here so tsc treats as used.
-void getUserIdByRaw;
+// Rollup pass: re-runs clustering / labeling / aggregates against sessions
+// that already have a partial SessionMeta in `insights_sessions`. Critical
+// detail: we read ids from the analyzed-set, not the raw `sessions` table,
+// so a checkpoint mid-fanout doesn't try to extract sessions the per-session
+// workers haven't reached yet (which would race them and double-pay LLM
+// calls). Cached extracts + embeddings make repeated rollups cheap; the
+// real work is kmeans / UMAP / aggregate math.
+//
+// Returns zero counts when no session has been analyzed yet — the caller
+// (job runner) treats that as a no-op success.
+export async function runRollup(opts: AnalyzeOptions): Promise<{
+  userCount: number;
+  sessionCount: number;
+  clusterCount: number;
+}> {
+  const ids = (
+    db
+      .prepare(
+        `SELECT s.id
+           FROM sessions s
+           INNER JOIN insights_sessions i ON i.session_id = s.id
+          ORDER BY s.created_at ASC`,
+      )
+      .all() as { id: string }[]
+  ).map((r) => r.id);
+  if (ids.length === 0) {
+    return { userCount: 0, sessionCount: 0, clusterCount: 0 };
+  }
+  return runPipeline(ids, opts);
+}

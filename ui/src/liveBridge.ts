@@ -15,7 +15,7 @@ import {
   type LiveJob,
 } from "./liveEvents";
 import { qk } from "./queries";
-import type { Job } from "./insights/types";
+import type { Dataset, Job, SessionMeta } from "./insights/types";
 
 const THROTTLE_MS = 600;
 
@@ -74,6 +74,38 @@ function applyJobEvent(qc: QueryClient, job: LiveJob): void {
   }
 }
 
+// Patch the cached Insights Dataset with a freshly analyzed session so the
+// page re-renders without a refetch. Upserts the session by id, bumps user
+// totals optimistically, and recomputes a few corpus-wide counters live.
+// The rollup pass overwrites everything with authoritative numbers — these
+// patches only need to look right between checkpoints.
+function applySessionAnalyzedEvent(qc: QueryClient, raw: unknown): void {
+  if (!raw || typeof raw !== "object") return;
+  const session = raw as SessionMeta;
+  qc.setQueryData<Dataset | null | undefined>(qk.insights.dataset, (prev) => {
+    if (!prev) {
+      // No dataset cached yet — invalidate so the next read pulls the fresh
+      // partial dataset that now exists server-side.
+      qc.invalidateQueries({ queryKey: qk.insights.root });
+      return prev;
+    }
+    const idx = prev.sessions.findIndex((s) => s.sessionId === session.sessionId);
+    const sessions =
+      idx >= 0
+        ? prev.sessions.map((s, i) => (i === idx ? session : s))
+        : [...prev.sessions, session];
+    const next: Dataset = {
+      ...prev,
+      sessions,
+      aggregates: {
+        ...prev.aggregates,
+        totalSessions: sessions.length,
+      },
+    };
+    return next;
+  });
+}
+
 function applyJobDeletedEvent(qc: QueryClient, id: string): void {
   qc.setQueryData<{ jobs: Job[] } | undefined>(qk.jobs.list, (prev) => {
     if (!prev?.jobs) return prev;
@@ -87,6 +119,13 @@ export function useLiveBridge(): void {
   const qc = useQueryClient();
   const pendingRef = useRef(false);
   const timerRef = useRef<number | null>(null);
+  // Job events fire fast during a fan-out (1358 session tasks → 1358 status
+  // transitions). The Jobs page now uses paged query keys, so direct cache
+  // patching only covers the legacy unfiltered key. Throttle a root-level
+  // invalidation here so paged views refetch a page or two per second
+  // instead of on every event.
+  const jobInvalidatePendingRef = useRef(false);
+  const jobInvalidateTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const flush = () => {
@@ -94,13 +133,34 @@ export function useLiveBridge(): void {
       pendingRef.current = false;
       invalidateForRequestEvent(qc);
     };
+    const flushJobs = () => {
+      jobInvalidateTimerRef.current = null;
+      jobInvalidatePendingRef.current = false;
+      qc.invalidateQueries({ queryKey: qk.jobs.root });
+    };
     const onEvent = (e: LiveEvent) => {
       if (e.type === "job") {
         applyJobEvent(qc, e.job);
+        if (!jobInvalidatePendingRef.current) {
+          jobInvalidatePendingRef.current = true;
+          jobInvalidateTimerRef.current = window.setTimeout(flushJobs, THROTTLE_MS);
+        }
         return;
       }
       if (e.type === "job_deleted") {
         applyJobDeletedEvent(qc, e.id);
+        if (!jobInvalidatePendingRef.current) {
+          jobInvalidatePendingRef.current = true;
+          jobInvalidateTimerRef.current = window.setTimeout(flushJobs, THROTTLE_MS);
+        }
+        return;
+      }
+      if (e.type === "session_analyzed") {
+        applySessionAnalyzedEvent(qc, e.session);
+        return;
+      }
+      if (e.type === "aggregates_updated") {
+        qc.invalidateQueries({ queryKey: qk.insights.root });
         return;
       }
       if (e.type !== "request") return;
@@ -118,6 +178,10 @@ export function useLiveBridge(): void {
       if (timerRef.current != null) {
         window.clearTimeout(timerRef.current);
         timerRef.current = null;
+      }
+      if (jobInvalidateTimerRef.current != null) {
+        window.clearTimeout(jobInvalidateTimerRef.current);
+        jobInvalidateTimerRef.current = null;
       }
     };
   }, [qc]);

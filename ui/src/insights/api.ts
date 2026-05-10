@@ -31,7 +31,22 @@ export const insightsApi = {
     }).then(j<Job>),
   getJob: (id: string) =>
     fetch(`/api/jobs/${encodeURIComponent(id)}`).then(j<Job>),
-  listJobs: () => fetch("/api/jobs").then(j<{ jobs: Job[] }>),
+  listJobs: (params?: {
+    scopePrefix?: string;
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const q = new URLSearchParams();
+    if (params?.scopePrefix) q.set("scope", params.scopePrefix);
+    if (params?.status) q.set("status", params.status);
+    if (params?.limit != null) q.set("limit", String(params.limit));
+    if (params?.offset != null) q.set("offset", String(params.offset));
+    const qs = q.toString();
+    return fetch(`/api/jobs${qs ? `?${qs}` : ""}`).then(
+      j<{ jobs: Job[]; total?: number; counts?: Record<string, number> }>,
+    );
+  },
   cancelJob: (id: string) =>
     fetch(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }).then(
       j<Job>,

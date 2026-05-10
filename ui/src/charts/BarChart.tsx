@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import * as d3 from "d3";
 import { useChartSize } from "./useChartSize";
+import { PortalTooltip } from "../components/PortalTooltip";
 
 type Datum = { name: string; count: number; fill: string };
 
@@ -12,7 +13,9 @@ type Props = {
 
 export function BarChart({ data, height = 280, rotateLabels = false }: Props) {
   const { ref, width } = useChartSize();
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [hover, setHover] = useState<{ idx: number; vx: number; vy: number } | null>(
+    null,
+  );
 
   const PAD = {
     top: 8,
@@ -76,8 +79,17 @@ export function BarChart({ data, height = 280, rotateLabels = false }: Props) {
                   fill={d.fill}
                   stroke="var(--color-ink)"
                   strokeWidth={2}
-                  onMouseEnter={() => setHoverIdx(i)}
-                  onMouseLeave={() => setHoverIdx(null)}
+                  onMouseEnter={() => {
+                    const host = ref.current;
+                    if (!host) return;
+                    const rect = host.getBoundingClientRect();
+                    setHover({
+                      idx: i,
+                      vx: rect.left + PAD.left + x + bw / 2,
+                      vy: rect.top + PAD.top + y,
+                    });
+                  }}
+                  onMouseLeave={() => setHover(null)}
                 />
               );
             })}
@@ -101,46 +113,19 @@ export function BarChart({ data, height = 280, rotateLabels = false }: Props) {
           </g>
         </svg>
       )}
-      {hoverIdx != null && data[hoverIdx] && (
-        <Tooltip
-          x={(xScale(data[hoverIdx]!.name) ?? 0) + xScale.bandwidth() / 2 + PAD.left}
-          y={PAD.top + yScale(data[hoverIdx]!.count) - 8}
-          containerWidth={w}
-        >
-          <div className="font-bold">{data[hoverIdx]!.name}</div>
+      {hover && data[hover.idx] && (
+        <PortalTooltip x={hover.vx} y={hover.vy} maxWidth={200}>
+          <div className="font-bold">{data[hover.idx]!.name}</div>
           <div className="flex items-center gap-2">
             <span
               className="inline-block h-2 w-2 border border-[var(--color-ink)]"
-              style={{ background: data[hoverIdx]!.fill }}
+              style={{ background: data[hover.idx]!.fill }}
             />
             <span className="opacity-70">count</span>
-            <span className="ml-auto tabular-nums">{data[hoverIdx]!.count}</span>
+            <span className="ml-auto tabular-nums">{data[hover.idx]!.count}</span>
           </div>
-        </Tooltip>
+        </PortalTooltip>
       )}
-    </div>
-  );
-}
-
-function Tooltip({
-  x,
-  y,
-  containerWidth,
-  children,
-}: {
-  x: number;
-  y: number;
-  containerWidth: number;
-  children: React.ReactNode;
-}) {
-  const W = 160;
-  const left = Math.min(Math.max(x - W / 2, 4), Math.max(containerWidth - W - 4, 4));
-  return (
-    <div
-      className="nb-card pointer-events-none absolute p-2 text-[11px]"
-      style={{ left, top: Math.max(y - 50, 4), width: W, background: "white" }}
-    >
-      {children}
     </div>
   );
 }

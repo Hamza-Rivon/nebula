@@ -30,7 +30,6 @@ const CURL_DEMO = `curl http://localhost:8080/v1/chat/completions \\
 export function ToolsPage() {
   const [q, setQ] = useState("");
   const [errorsOnly, setErrorsOnly] = useState(false);
-  const [open, setOpen] = useState<Set<string>>(new Set());
 
   const filters = useMemo(
     () => ({ q: q.trim() || undefined, errorsOnly: errorsOnly || undefined }),
@@ -47,15 +46,6 @@ export function ToolsPage() {
   );
   const loading = list.isLoading || list.isFetchingNextPage;
   const done = !list.hasNextPage;
-
-  const toggle = (n: string) => {
-    setOpen((s) => {
-      const next = new Set(s);
-      if (next.has(n)) next.delete(n);
-      else next.add(n);
-      return next;
-    });
-  };
 
   const top = rows.slice(0, 10).map((t, i) => ({
     name: t.name,
@@ -148,16 +138,15 @@ export function ToolsPage() {
               <th className="text-right">Cost</th>
               <th className="text-right">Error rate</th>
               <th>Top model</th>
-              <th></th>
             </tr>
           </thead>
           <tbody>
             {rows.map((t) => (
-              <Row key={t.name} t={t} open={open.has(t.name)} onToggle={() => toggle(t.name)} />
+              <Row key={t.name} t={t} />
             ))}
             {!loading && !rows.length && (
               <tr>
-                <td colSpan={7}>
+                <td colSpan={6}>
                   <EmptyState
                     title="No tools match"
                     hint="Send a request whose model invokes a function, or clear the filter."
@@ -169,7 +158,7 @@ export function ToolsPage() {
             )}
             {!done && rows.length > 0 && (
               <tr>
-                <td colSpan={7} className="table-loadmore">
+                <td colSpan={6} className="table-loadmore">
                   <div ref={sentinelRef} className="infinite-sentinel" />
                   {loading ? "loading more…" : `${rows.length} of ${total} loaded`}
                 </td>
@@ -182,75 +171,38 @@ export function ToolsPage() {
   );
 }
 
-function Row({ t, open, onToggle }: { t: ToolUsage; open: boolean; onToggle: () => void }) {
+function Row({ t }: { t: ToolUsage }) {
   const errPct = (t.error_rate * 100).toFixed(1);
   return (
-    <>
-      <tr onClick={onToggle}>
-        <td>
-          <span className="nb-tag">{t.name}</span>
-        </td>
-        <td className="text-right tabular-nums">{fmt.num(t.count)}</td>
-        <td className="text-right tabular-nums">{Math.round(t.avg_latency_ms || 0)}ms</td>
-        <td className="text-right tabular-nums">{fmt.cost(t.cost)}</td>
-        <td className="text-right tabular-nums">
-          <span
-            className="nb-chip"
-            style={{
-              background:
-                t.error_rate > 0.1
-                  ? "var(--color-rose)"
-                  : t.error_rate > 0
-                    ? "var(--color-butter)"
-                    : "var(--color-mint)",
-            }}
-          >
-            {errPct}%
-          </span>
-        </td>
-        <td>
-          {t.top_model ? (
-            <span className="nb-tag">{t.top_model}</span>
-          ) : (
-            <span className="opacity-40">—</span>
-          )}
-        </td>
-        <td>
-          <button
-            type="button"
-            className="nb-chip"
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggle();
-            }}
-            style={{ background: open ? "var(--color-butter)" : "#fff" }}
-          >
-            {open ? "hide args" : "sample args"}
-          </button>
-        </td>
-      </tr>
-      {open && (
-        <tr>
-          <td colSpan={7} style={{ background: "var(--color-mist)" }}>
-            <pre className="scrollbar-soft max-h-64 overflow-auto rounded border-2 border-[var(--color-ink)] bg-white p-3 font-mono text-xs">
-              {prettyArgs(t.sample_args)}
-            </pre>
-          </td>
-        </tr>
-      )}
-    </>
+    <tr>
+      <td>
+        <span className="nb-tag">{t.name}</span>
+      </td>
+      <td className="text-right tabular-nums">{fmt.num(t.count)}</td>
+      <td className="text-right tabular-nums">{Math.round(t.avg_latency_ms || 0)}ms</td>
+      <td className="text-right tabular-nums">{fmt.cost(t.cost)}</td>
+      <td className="text-right tabular-nums">
+        <span
+          className="nb-chip"
+          style={{
+            background:
+              t.error_rate > 0.1
+                ? "var(--color-rose)"
+                : t.error_rate > 0
+                  ? "var(--color-butter)"
+                  : "var(--color-mint)",
+          }}
+        >
+          {errPct}%
+        </span>
+      </td>
+      <td>
+        {t.top_model ? (
+          <span className="nb-tag">{t.top_model}</span>
+        ) : (
+          <span className="opacity-40">—</span>
+        )}
+      </td>
+    </tr>
   );
-}
-
-function prettyArgs(samples: string[] | null): string {
-  if (!samples || samples.length === 0) return "(no captured arguments)";
-  return samples
-    .map((s) => {
-      try {
-        return JSON.stringify(JSON.parse(s), null, 2);
-      } catch {
-        return s;
-      }
-    })
-    .join("\n\n---\n\n");
 }

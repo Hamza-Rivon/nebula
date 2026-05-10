@@ -41,6 +41,14 @@ export type LiveEvent =
     }
   | { type: "job"; job: LiveJob }
   | { type: "job_deleted"; id: string }
+  // Emitted whenever a per-session analyze task finishes a write. Carries
+  // the freshly persisted SessionMeta JSON so UI clients can patch the
+  // Insights dataset cache in place — no full refetch per session.
+  | { type: "session_analyzed"; session: unknown }
+  // Emitted at the end of a `rollup` job after clusters / users / aggregates
+  // are recomputed. UI invalidates the dataset query so it refetches with
+  // the final cross-session view (cluster ids on asks, user totals, etc.).
+  | { type: "aggregates_updated" }
   | { type: "ping" };
 
 export function publishEvent(event: LiveEvent): void {

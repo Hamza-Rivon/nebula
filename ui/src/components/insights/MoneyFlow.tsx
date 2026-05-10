@@ -16,8 +16,10 @@ type Lens = "reason" | "team" | "engineer" | "outcome";
 
 interface Props {
   data: Dataset;
+  anonymized: boolean;
   onOpenWaste: (type: string) => void;
   onOpenUser: (id: string) => void;
+  onOpenTeam: (id: string) => void;
 }
 
 interface NodeDatum {
@@ -25,7 +27,7 @@ interface NodeDatum {
   label: string;
   category: "total" | "productive" | "wasted" | "split";
   splitKind?: "waste" | "productive";
-  payload?: { wasteType?: string; userId?: string };
+  payload?: { wasteType?: string; userId?: string; teamId?: string };
 }
 interface LinkDatum {
   source: string;
@@ -34,8 +36,20 @@ interface LinkDatum {
   kind: "productive" | "wasted";
 }
 
-export function MoneyFlow({ data, onOpenWaste, onOpenUser }: Props) {
+export function MoneyFlow({
+  data,
+  anonymized,
+  onOpenWaste,
+  onOpenUser,
+  onOpenTeam,
+}: Props) {
   const [lens, setLens] = useState<Lens>("reason");
+  useEffect(() => {
+    if (anonymized && lens === "engineer") setLens("team");
+  }, [anonymized, lens]);
+  const lensOptions: Lens[] = anonymized
+    ? ["reason", "team", "outcome"]
+    : ["reason", "team", "engineer", "outcome"];
   const pal = PALETTE;
   const COLORS = {
     total: pal.total,
@@ -141,7 +155,7 @@ export function MoneyFlow({ data, onOpenWaste, onOpenUser }: Props) {
           <h3 className="panel-title">Spend flow</h3>
         </div>
         <div className="lens-switch">
-          {(["reason", "team", "engineer", "outcome"] as Lens[]).map((l) => (
+          {lensOptions.map((l) => (
             <button
               key={l}
               className={`lens-pill ${lens === l ? "active" : ""}`}
@@ -206,10 +220,15 @@ export function MoneyFlow({ data, onOpenWaste, onOpenUser }: Props) {
                   // user drawer. Works for both productive and waste sides.
                   const interactable =
                     n.category === "split" &&
-                    !!(n.payload?.wasteType || n.payload?.userId);
+                    !!(
+                      n.payload?.wasteType ||
+                      n.payload?.userId ||
+                      n.payload?.teamId
+                    );
                   const onClick = () => {
                     if (!n.payload) return;
                     if (n.payload.wasteType) onOpenWaste(n.payload.wasteType);
+                    else if (n.payload.teamId) onOpenTeam(n.payload.teamId);
                     else if (n.payload.userId) onOpenUser(n.payload.userId);
                   };
                   return (
@@ -357,7 +376,7 @@ function lensSplits(
   label: string;
   usd: number;
   kind: "waste" | "productive";
-  payload?: { wasteType?: string; userId?: string };
+  payload?: { wasteType?: string; userId?: string; teamId?: string };
 }[] {
   const a = data.aggregates;
 
@@ -409,6 +428,7 @@ function lensSplits(
         label: team,
         usd,
         kind: "productive" as const,
+        payload: { teamId: team },
       }))
       .filter((s) => s.usd > 0)
       .sort((x, y) => y.usd - x.usd);
@@ -418,6 +438,7 @@ function lensSplits(
         label: team,
         usd,
         kind: "waste" as const,
+        payload: { teamId: team },
       }))
       .filter((s) => s.usd > 0)
       .sort((x, y) => y.usd - x.usd);
@@ -484,12 +505,25 @@ function sessionTypeLabel(t: string): string {
 
 // ---------- Spend-vs-win-rate scatter ----------
 
+export interface ScatterEntity {
+  id: string;
+  label: string;
+  spend: number;
+  winRate: number;
+  size: number;
+  color: string;
+}
+
 export function SpendWinScatter({
-  data,
-  onOpenUser,
+  entities,
+  xAxisLabel = "Spend",
+  yAxisLabel = "Win rate",
+  onOpen,
 }: {
-  data: Dataset;
-  onOpenUser: (id: string) => void;
+  entities: ScatterEntity[];
+  xAxisLabel?: string;
+  yAxisLabel?: string;
+  onOpen: (id: string) => void;
 }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState<{ w: number; h: number }>({ w: 900, h: 360 });
@@ -508,31 +542,20 @@ export function SpendWinScatter({
   const { w, h } = size;
   const pad = { l: 64, r: 32, t: 24, b: 48 };
 
-  const xMax = Math.max(1, ...data.users.map((u) => u.totalCostUsd));
+  const xMax = Math.max(1, ...entities.map((e) => e.spend));
   const xScale = scaleLinear()
     .domain([0, xMax])
     .nice()
     .range([pad.l, w - pad.r]);
   const yScale = scaleLinear().domain([0, 1]).range([h - pad.b, pad.t]);
   const rScale = scaleLinear()
-    .domain([0, Math.max(1, ...data.users.map((u) => u.sessionCount))])
+    .domain([0, Math.max(1, ...entities.map((e) => e.size))])
     .range([8, 18]);
 
   const xTicks = xScale.ticks(5);
   const yTicks = [0, 0.25, 0.5, 0.75, 1];
   const innerW = w - pad.l - pad.r;
   const xMid = pad.l + innerW / 2;
-
-  const personaColor = (p: string) =>
-    p === "power"
-      ? pal.persona.power
-      : p === "active"
-        ? pal.persona.active
-        : p === "stuck"
-          ? pal.persona.stuck
-          : p === "misuser"
-            ? pal.persona.misuser
-            : pal.persona.lurker;
 
   return (
     <div className="scatter-card" ref={wrapRef}>
@@ -604,7 +627,7 @@ export function SpendWinScatter({
           fontWeight={700}
           style={{ letterSpacing: "0.22em", textTransform: "uppercase" }}
         >
-          Win rate
+          {yAxisLabel}
         </text>
         <text
           x={xMid}
@@ -615,26 +638,25 @@ export function SpendWinScatter({
           fontWeight={700}
           style={{ letterSpacing: "0.22em", textTransform: "uppercase" }}
         >
-          Spend
+          {xAxisLabel}
         </text>
-        {data.users.map((u) => {
-          const cx = xScale(u.totalCostUsd);
-          const cy = yScale(u.winRate);
-          const r = rScale(u.sessionCount);
-          const color = personaColor(u.persona);
+        {entities.map((e) => {
+          const cx = xScale(e.spend);
+          const cy = yScale(e.winRate);
+          const r = rScale(e.size);
           const flipLeft = cx > w - pad.r - 140;
           const tx = flipLeft ? cx - r - 8 : cx + r + 8;
           return (
             <g
-              key={u.id}
+              key={e.id}
               style={{ cursor: "pointer" }}
-              onClick={() => onOpenUser(u.id)}
+              onClick={() => onOpen(e.id)}
             >
               <circle
                 cx={cx}
                 cy={cy}
                 r={r}
-                fill={color}
+                fill={e.color}
                 fillOpacity={0.85}
                 stroke={pal.outline}
                 strokeWidth={2}
@@ -647,7 +669,7 @@ export function SpendWinScatter({
                 fill={pal.axisText}
                 fontWeight={600}
               >
-                {u.displayName}
+                {e.label}
               </text>
               <text
                 x={tx}
@@ -658,7 +680,7 @@ export function SpendWinScatter({
                 opacity={0.65}
                 style={{ fontFeatureSettings: '"tnum"' }}
               >
-                {Math.round(u.winRate * 100)}% · {formatUsd(u.totalCostUsd, { decimals: 0 })}
+                {Math.round(e.winRate * 100)}% · {formatUsd(e.spend, { decimals: 0 })}
               </text>
             </g>
           );

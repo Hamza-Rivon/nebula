@@ -293,3 +293,17 @@ body {
 .recharts-cartesian-grid-vertical line {
   stroke: rgba(17,17,17,0.12);
 }
+
+/* Tooltips rendered into a portal so they escape any clipping ancestor.
+   Always sit above page chrome with high z-index. */
+.portal-tooltip {
+  background: #fff;
+  border: 2px solid var(--color-ink);
+  border-radius: 8px;
+  box-shadow: 4px 4px 0 0 var(--color-ink);
+  padding: 0.4rem 0.65rem;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  pointer-events: none;
+  z-index: 9999;
+}

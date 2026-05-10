@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import * as d3 from "d3";
 import { useChartSize } from "./useChartSize";
+import { PortalTooltip } from "../components/PortalTooltip";
 
 export type AreaSeries = { key: string; fill: string; label?: string };
 
@@ -17,7 +18,10 @@ const PAD = { top: 8, right: 12, bottom: 24, left: 36 };
 
 export function AreaChart({ data, xKey, series, height = 280, stack = false, yAllowDecimals = true }: Props) {
   const { ref, width } = useChartSize();
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [hover, setHover] = useState<{ idx: number; vx: number; vy: number } | null>(
+    null,
+  );
+  const hoverIdx = hover?.idx ?? null;
 
   const w = Math.max(width, 0);
   const h = height;
@@ -94,7 +98,8 @@ export function AreaChart({ data, xKey, series, height = 280, stack = false, yAl
     const x = e.clientX - rect.left - PAD.left;
     const step = innerW / Math.max(data.length - 1, 1);
     const idx = Math.max(0, Math.min(data.length - 1, Math.round(x / step)));
-    setHoverIdx(idx);
+    const localX = (xScale(String(data[idx]?.[xKey])) ?? 0) + PAD.left;
+    setHover({ idx, vx: rect.left + localX, vy: rect.top + PAD.top });
   }
 
   return (
@@ -104,7 +109,7 @@ export function AreaChart({ data, xKey, series, height = 280, stack = false, yAl
           width={w}
           height={h}
           onMouseMove={onMove}
-          onMouseLeave={() => setHoverIdx(null)}
+          onMouseLeave={() => setHover(null)}
           style={{ display: "block" }}
         >
           <g transform={`translate(${PAD.left},${PAD.top})`}>
@@ -167,41 +172,18 @@ export function AreaChart({ data, xKey, series, height = 280, stack = false, yAl
           </g>
         </svg>
       )}
-      {hoverIdx != null && data[hoverIdx] && (
-        <Tooltip x={(xScale(String(data[hoverIdx]![xKey])) ?? 0) + PAD.left} y={PAD.top} containerWidth={w}>
-          <div className="font-bold">{String(data[hoverIdx]![xKey])}</div>
+      {hover && data[hover.idx] && (
+        <PortalTooltip x={hover.vx} y={hover.vy} maxWidth={200}>
+          <div className="font-bold">{String(data[hover.idx]![xKey])}</div>
           {series.map((s) => (
             <div key={s.key} className="flex items-center gap-2">
               <span className="inline-block h-2 w-2 border border-[var(--color-ink)]" style={{ background: s.fill }} />
               <span className="opacity-70">{s.label ?? s.key}</span>
-              <span className="ml-auto tabular-nums">{fmtTick(Number(data[hoverIdx]![s.key] ?? 0))}</span>
+              <span className="ml-auto tabular-nums">{fmtTick(Number(data[hover.idx]![s.key] ?? 0))}</span>
             </div>
           ))}
-        </Tooltip>
+        </PortalTooltip>
       )}
-    </div>
-  );
-}
-
-function Tooltip({
-  x,
-  y,
-  containerWidth,
-  children,
-}: {
-  x: number;
-  y: number;
-  containerWidth: number;
-  children: React.ReactNode;
-}) {
-  const W = 140;
-  const left = Math.min(Math.max(x - W / 2, 4), Math.max(containerWidth - W - 4, 4));
-  return (
-    <div
-      className="nb-card pointer-events-none absolute p-2 text-[11px]"
-      style={{ left, top: y, width: W, background: "white" }}
-    >
-      {children}
     </div>
   );
 }

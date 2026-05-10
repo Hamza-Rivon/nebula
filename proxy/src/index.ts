@@ -6,7 +6,7 @@ import { gateway } from "./gateway.js";
 import { api } from "./api.js";
 import { seedFromDir } from "./seed.js";
 import { db } from "./db.js";
-import { enqueueJob } from "./insights/jobs.js";
+import { enqueueJob, resumeQueuedJobs } from "./insights/jobs.js";
 import { countUnanalyzedSessions } from "./insights/db.js";
 import { bootstrapCatalog } from "./catalog.js";
 
@@ -77,18 +77,18 @@ if (existsSync(seedDir) && statSync(seedDir).isDirectory()) {
       );
       // Auto-enqueue only when there's actual work to do. Every container
       // restart re-runs the seed; content-addressed sha256 means a steady
-      // state produces imported=0, but the unconditional analyze it used to
-      // trigger still re-clustered the entire corpus on every boot. Gate on
-      // the count of sessions that don't have a SessionMeta yet — the only
-      // ones for which the pipeline would do new work. The manual "Re-
-      // analyze" button is unchanged: it always enqueues, optionally with
-      // force, so users can iterate at will.
+      // state produces imported=0. The fan-out queue persists across restarts
+      // — leftover queued session tasks just need a worker kick to drain.
+      // For genuinely unanalyzed sessions (no SessionMeta yet) we enqueue a
+      // fresh "all" which fans out into per-session jobs and a final rollup.
       const total = (db.prepare(`SELECT COUNT(*) AS n FROM sessions`).get() as { n: number }).n;
       const unanalyzed = countUnanalyzedSessions();
+      // Pick up any queued session/rollup rows from a previous shutdown.
+      resumeQueuedJobs();
       if (autoAnalyze && unanalyzed > 0) {
         const job = enqueueJob("all");
         console.log(
-          `✦ Nebula auto-analyze: job ${job.id} status=${job.status} (${unanalyzed}/${total} sessions need analysis)`,
+          `✦ Nebula auto-analyze: anchor ${job.id} scope=${job.scope} (${unanalyzed}/${total} sessions need analysis)`,
         );
       } else if (autoAnalyze && total > 0) {
         console.log(

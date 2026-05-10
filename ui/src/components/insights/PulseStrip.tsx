@@ -1,9 +1,16 @@
 import type { Dataset } from "../../insights/types";
 import { formatUsd } from "../../insights/format";
 
-export function PulseStrip({ data }: { data: Dataset }) {
+export function PulseStrip({
+  data,
+  anonymized,
+}: {
+  data: Dataset;
+  anonymized: boolean;
+}) {
   const a = data.aggregates;
   const adoptionPct = Math.round(a.adoptionPct * 100);
+  const teamCount = new Set(data.users.map((u) => u.team)).size;
   const winPct = Math.round(a.firmWinRate * 100);
   const wastePct =
     a.totalCostUsd > 0
@@ -20,7 +27,11 @@ export function PulseStrip({ data }: { data: Dataset }) {
       <PulseTile
         label="Adoption"
         value={`${adoptionPct}%`}
-        sub={`${a.totalUsers} engineers tracked`}
+        sub={
+          anonymized
+            ? `${teamCount} teams tracked`
+            : `${a.totalUsers} engineers tracked`
+        }
         accent={adoptionPct >= 60 ? "good" : adoptionPct >= 30 ? undefined : "warm"}
       />
       <PulseTile

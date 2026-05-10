@@ -10,7 +10,15 @@ import {
   listSessionsForUser,
   listSessionsByFriction,
 } from "./db.js";
-import { cancelJob, deleteJob, enqueueJob, getJob, listJobs } from "./jobs.js";
+import {
+  cancelJob,
+  deleteJob,
+  enqueueJob,
+  getJob,
+  jobCounts,
+  listJobs,
+  listJobsFiltered,
+} from "./jobs.js";
 
 export const insightsApi = new Hono();
 
@@ -44,7 +52,29 @@ insightsApi.get("/jobs/:id", (c) => {
 });
 
 insightsApi.get("/jobs", (c) => {
-  return c.json({ jobs: listJobs(20) });
+  // Filterable listing for the queue view: with N=1k+ session task rows the
+  // simple `LIMIT 20` from before is no longer enough. Defaults preserve the
+  // old behaviour for any existing callers.
+  const scopePrefix = c.req.query("scope")?.trim();
+  const status = c.req.query("status")?.trim();
+  const limitRaw = Number(c.req.query("limit") ?? 50);
+  const offsetRaw = Number(c.req.query("offset") ?? 0);
+  const limit = Math.min(Math.max(1, isFinite(limitRaw) ? limitRaw : 50), 500);
+  const offset = Math.max(0, isFinite(offsetRaw) ? offsetRaw : 0);
+  if (!scopePrefix && !status && offset === 0 && limit <= 20) {
+    return c.json({ jobs: listJobs(limit), total: undefined, counts: jobCounts() });
+  }
+  const result = listJobsFiltered({
+    scopePrefix: scopePrefix && scopePrefix.length > 0 ? scopePrefix : undefined,
+    status: (status as any) || undefined,
+    limit,
+    offset,
+  });
+  return c.json({ ...result, counts: jobCounts() });
+});
+
+insightsApi.get("/jobs/stats", (c) => {
+  return c.json({ counts: jobCounts() });
 });
 
 // Cancel a queued or running job. Idempotent against terminal rows: hitting
