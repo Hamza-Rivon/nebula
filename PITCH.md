@@ -122,3 +122,16 @@ why you and not the competition?
 - Session satisfaction  
 - Track recursive loops  
 - Use a lot of metrics collected automatically on ai conversations and create models with it in order to better predict failures and problems with ai usage  
+
+
+## Pitch
+### Opening
+Agents are becoming more and more used in tech companies, and many managers and CTOs still do not know whether they are improving efficiency or just burning tokens.
+
+### Problem
+High adoption does not mean efficiency.
+The efficiency of these agents depend on how the users use them.
+
+### Solution
+We built a solution that extracts insightful data from the conversations themselves and points out how employees are using ai.
+With this, 
