@@ -1,5 +1,0 @@
-dist/
-node_modules/
-public/sessions.json
-.cache/
-public/transcripts/
