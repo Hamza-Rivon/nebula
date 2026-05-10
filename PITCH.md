@@ -129,14 +129,15 @@ why you and not the competition?
 Our CTO spent 3'000$ on credits this month. 20% of it was wasted.  
 
 ### Problem
-Agents are becoming more and more used in tech companies, and many managers and CTOs still do not know whether they are improving efficiency or just burning tokens.  
+Agents are becoming more and more used in tech companies; managers and CTOs still do not know whether they are improving efficiency or just burning tokens.  
 
 High adoption does not mean efficiency.  
 Efficiency depends on how the ai is used.  
 
 ### Solution
-We built a B2B solution that analyzes the conversations employees have with ai.  
-Managers then take action to improve their employees' performances and reduse ai costs.  
+Hello, my name is Tristan and I'm here today with my co-founders Leonard and Hamza. 
+We built Nebula, a B2B solution that analyzes the interactions employees have with ai.  
+Hamza will show you how managers take action.
 
 ### Demo
 The app works with a proxy listing all llm conversations  
